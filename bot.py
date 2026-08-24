@@ -1,7 +1,6 @@
 import logging
 import json
 import os
-import re
 from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
@@ -26,42 +25,41 @@ def get_client():
     return gspread.authorize(creds)
 
 def get_products():
-    """Read item_desc column live from the COMEX tab."""
+    """Read product name, category, and brand live from the COMEX tab."""
     ws = get_client().open(SPREADSHEET_NAME).worksheet(PRODUCT_TAB)
-    col = ws.col_values(1)  # column A = item_desc
-    # skip header rows, drop blanks
-    products = [p.strip() for p in col[2:] if p.strip()]
+    rows = ws.get_all_values()
+    products = []
+    for row in rows[2:]:  # skip the two header rows
+        name = row[0].strip() if len(row) > 0 else ""      # column A
+        category = row[3].strip() if len(row) > 3 else ""  # column D
+        brand = row[4].strip() if len(row) > 4 else ""     # column E
+        if name:
+            products.append({
+                "name": name,
+                "category": category or "Other",
+                "brand": brand or "Other",
+            })
     return products
 
 def save_sale(name, product, delivery, preorder):
     ws = get_client().open(SPREADSHEET_NAME).worksheet(SALES_TAB)
-    # S/N = number of existing data rows (minus header) + 1
-    existing = ws.col_values(1)
-    sn = len([v for v in existing[1:] if v.strip()]) + 1
-    ws.append_row([
+
+    # Find the first empty row based on the Name column (column B)
+    names = ws.col_values(2)  # column B = Name
+    next_row = len(names) + 1  # first row after the last filled Name
+
+    # S/N = count of existing data rows (excluding header)
+    sn = next_row - 1
+
+    values = [
         sn,
         name,
         product,
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        datetime.now().strftime("%-I:%M%p"),   # e.g. 3:40PM
         delivery,
         preorder,
-    ])
-
-# ---------- Categorisation ----------
-def categorise(product):
-    p = product.lower()
-    if "soundbar" in p or "arc" in p or "beam" in p or "heston" in p:
-        return "Soundbars"
-    if "sub" in p:
-        return "Subwoofers"
-    if any(k in p for k in ["monitor", "major", "minor", "motif", "ace", "mode"]):
-        return "Headphones"
-    if any(k in p for k in ["emberton", "willen", "kilburn", "middleton", "roam", "move"]):
-        return "Portable Speakers"
-    return "Home Speakers"
-
-def get_brand(product):
-    return "Marshall" if product.lower().startswith("marshall") else "Sonos"
+    ]
+    ws.update(f"A{next_row}:F{next_row}", [values])
 
 # ---------- Keyboard builder ----------
 def build_keyboard(items, prefix, per_row=1):
@@ -77,7 +75,7 @@ async def sale(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["sale"] = {}
     products = get_products()
     context.user_data["all_products"] = products
-    brands = sorted(set(get_brand(p) for p in products))
+    brands = sorted(set(p["brand"] for p in products))
     await update.message.reply_text(
         "Select a brand:",
         reply_markup=build_keyboard(brands, "brand", per_row=2)
@@ -92,7 +90,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if step == "brand":
         sale_data["brand"] = value
-        cats = sorted(set(categorise(p) for p in products if get_brand(p) == value))
+        cats = sorted(set(p["category"] for p in products if p["brand"] == value))
         await query.edit_message_text(
             f"Brand: {value}\n\nSelect a category:",
             reply_markup=build_keyboard(cats, "cat", per_row=2)
@@ -101,10 +99,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif step == "cat":
         sale_data["cat"] = value
         brand = sale_data["brand"]
-        models = [p for p in products if get_brand(p) == brand and categorise(p) == value]
-        # store models indexed, since names are long (callback_data max 64 bytes)
+        models = [p["name"] for p in products
+                  if p["brand"] == brand and p["category"] == value]
         context.user_data["models"] = models
-        buttons = [InlineKeyboardButton(m, callback_data=f"model:{i}") for i, m in enumerate(models)]
+        buttons = [InlineKeyboardButton(m, callback_data=f"model:{i}")
+                   for i, m in enumerate(models)]
         rows = [[b] for b in buttons]
         await query.edit_message_text(
             f"{sale_data['brand']} › {value}\n\nSelect a model:",
