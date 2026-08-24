@@ -10,7 +10,7 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ContextTypes
 )
 
-BOT_TOKEN = os.environ["8693678368:AAGGdz-rX9yy6WcV0ytpcizKey9R0nZ6WSE"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_NAME = "Tradeshow Prints Marshall/Sonos (Sales Sheet)"
 PRODUCT_TAB = "COMEX Show 2026"
 SALES_TAB = "Sales Tracker"
