@@ -62,23 +62,30 @@ def get_products(force=False):
     return _products_cache
 
 def save_sale(name, product, delivery, preorder, qty=1, retries=3):
-    """Write qty rows in a single append, with retry on transient errors."""
+    """Write qty rows starting at the first empty row below the header."""
     tz = ZoneInfo("Asia/Singapore")
     timestamp = datetime.now(tz).strftime("%-I:%M%p")  # e.g. 3:40PM, SG time
 
     for attempt in range(retries):
         try:
             ws = get_spreadsheet().worksheet(SALES_TAB)
+
+            # Find first empty row based on the Name column (B), header is row 1
+            names = ws.col_values(2)          # column B = Name
+            next_row = len(names) + 1
+            if next_row < 2:                  # safety: never write on the header
+                next_row = 2
+
             rows = [
                 ["", name, product, timestamp, delivery, preorder]
                 for _ in range(qty)
             ]
-            # append all rows at once; Sheets finds the next empty row itself
-            ws.append_rows(rows, table_range="A1")
+            end_row = next_row + qty - 1
+            ws.update(f"A{next_row}:F{end_row}", rows)
             return True
         except Exception as e:
             logging.warning(f"save_sale attempt {attempt+1} failed: {e}")
-            time.sleep(2 * (attempt + 1))  # back off, then retry
+            time.sleep(2 * (attempt + 1))
     return False
 
 # ---------- Keyboard builder ----------
