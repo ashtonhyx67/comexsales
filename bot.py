@@ -3,6 +3,7 @@ import json
 import os
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import gspread
 from google.oauth2.service_account import Credentials
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -60,23 +61,20 @@ def get_products(force=False):
         _cache_time = now
     return _products_cache
 
-def save_sale(name, product, delivery, preorder, retries=3):
-    """Write one sale, with retry on transient API errors / rate limits."""
+def save_sale(name, product, delivery, preorder, qty=1, retries=3):
+    """Write qty rows in a single append, with retry on transient errors."""
+    tz = ZoneInfo("Asia/Singapore")
+    timestamp = datetime.now(tz).strftime("%-I:%M%p")  # e.g. 3:40PM, SG time
+
     for attempt in range(retries):
         try:
             ws = get_spreadsheet().worksheet(SALES_TAB)
-            names = ws.col_values(2)          # column B = Name
-            next_row = len(names) + 1
-            sn = next_row - 1
-            values = [
-                sn,
-                name,
-                product,
-                datetime.now().strftime("%-I:%M%p"),  # e.g. 3:40PM
-                delivery,
-                preorder,
+            rows = [
+                ["", name, product, timestamp, delivery, preorder]
+                for _ in range(qty)
             ]
-            ws.update(f"A{next_row}:F{next_row}", [values])
+            # append all rows at once; Sheets finds the next empty row itself
+            ws.append_rows(rows, table_range="A1")
             return True
         except Exception as e:
             logging.warning(f"save_sale attempt {attempt+1} failed: {e}")
@@ -205,13 +203,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = query.from_user.first_name
         qty = int(sale_data["qty"])
 
-        # Write one row per unit so stock totals stay accurate
-        ok = True
-        for _ in range(qty):
-            if not save_sale(name, sale_data["product"],
-                             sale_data["delivery"], sale_data["preorder"]):
-                ok = False
-                break
+        ok = save_sale(name, sale_data["product"],
+                       sale_data["delivery"], sale_data["preorder"], qty=qty)
 
         if ok:
             await query.edit_message_text(
