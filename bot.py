@@ -1,6 +1,7 @@
 import logging
 import json
 import os
+import re
 import time
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
@@ -18,16 +19,21 @@ PRODUCT_TAB = "COMEX Show 2026"
 SALES_TAB = "Sales Tracker"
 
 # ---------- Show-day layout ----------
-# Each show day gets its own 6-column block on the Sales Tracker tab, laid out by hand:
-#   a day label row, then the header row (S/N, Name, Product (Colour), Time,
-#   Delivery?, Pre-order?), then the sales rows beneath it.
-SHOW_DAYS = [
-    (date(2026, 9, 3), "A"),   # A - F
-    (date(2026, 9, 4), "H"),   # H - M
-    (date(2026, 9, 5), "O"),   # O - T
-    (date(2026, 9, 6), "V"),   # V - AA
-]
-BLOCK_WIDTH = 6  # S/N, Name, Product (Colour), Time, Delivery?, Pre-order?
+# Each show day gets its own 6-column block on the Sales Tracker tab:
+#   a day label row ("DAY 1 (3 Sept)"), then the header row (S/N, Name,
+#   Product (Colour), Time, Delivery?, Pre-order?), then the sales rows beneath it.
+# The layout is read off the sheet on every save rather than hardcoded, so an
+# inserted column or an extra day block can't silently send sales to the wrong place.
+SHOW_YEAR = 2026  # the day labels carry no year
+BLOCK_WIDTH = 6   # S/N, Name, Product (Colour), Time, Delivery?, Pre-order?
+EXPECTED_HEADERS = ["s/n", "name", "product", "time", "delivery", "pre-order"]
+DAY_LABEL_RE = re.compile(r"^\s*DAY\s*\d+\s*\(\s*(\d{1,2})\s*([A-Za-z]+)", re.I)
+MONTHS = ["jan", "feb", "mar", "apr", "may", "jun",
+          "jul", "aug", "sep", "oct", "nov", "dec"]
+
+
+class LayoutError(Exception):
+    """The Sales Tracker tab doesn't look the way the bot expects."""
 
 logging.basicConfig(level=logging.INFO)
 
@@ -97,45 +103,98 @@ def day_label(d):
         month = "SEPT"
     return f"{d.day} {month} ({d.strftime('%a').upper()})"
 
-def block_for(d):
-    """Return (show_date, start_column_letter) for the block a given date writes into.
-
-    Dates before the show fall into day 1's block; dates after it fall into day 4's.
-    """
-    for show_date, col in SHOW_DAYS:
-        if d <= show_date:
-            return show_date, col
-    return SHOW_DAYS[-1]
-
 def block_range(start_letter, row_start, row_end):
     c0 = col_to_index(start_letter)
     return f"{start_letter}{row_start}:{index_to_col(c0 + BLOCK_WIDTH - 1)}{row_end}"
 
-def find_data_start(ws, start_letter):
-    """Locate the row where a block's sales rows begin (the row after its header row).
+# ---------- Layout discovery ----------
+def _norm(text):
+    return " ".join(text.split()).strip().lower()
 
-    Scans the top of the block for the header row (the one whose 2nd cell is 'Name'),
-    so it works whether the day label sits on one row above the headers or two.
+def parse_day_label(text):
+    """'DAY 1 (3 Sept)' -> date(SHOW_YEAR, 9, 3). None if it isn't a day label."""
+    m = DAY_LABEL_RE.match(text or "")
+    if not m:
+        return None
+    day, month = int(m.group(1)), m.group(2)[:3].lower()
+    if month not in MONTHS:
+        return None
+    try:
+        return date(SHOW_YEAR, MONTHS.index(month) + 1, day)
+    except ValueError:
+        return None
+
+def header_at(row, c0):
+    """True if the BLOCK_WIDTH cells starting at 0-based column c0 are the block headers."""
+    cells = [row[i] if i < len(row) else "" for i in range(c0, c0 + BLOCK_WIDTH)]
+    return all(_norm(c).startswith(h) for c, h in zip(cells, EXPECTED_HEADERS))
+
+def discover_blocks(ws):
+    """Read the day blocks off the sheet: [(show_date, start_letter, data_start_row), ...].
+
+    Raises LayoutError rather than guessing, so a reshuffled sheet stops the bot
+    instead of dropping sales into the wrong day's columns.
     """
-    top = ws.get(block_range(start_letter, 1, 6)) or []
-    for i, row in enumerate(top, start=1):
-        if len(row) > 1 and row[1].strip().lower().startswith("name"):
-            return i + 1
-    return 3  # fallback: label row 1, header row 2, data from row 3
+    top = ws.get(f"A1:{index_to_col(ws.col_count)}8") or []
+    label_row = top[0] if top else []
+
+    blocks, problems = [], []
+    for c0, text in enumerate(label_row):
+        show_date = parse_day_label(text)
+        if show_date is None:
+            continue
+        letter = index_to_col(c0 + 1)
+        for r in range(1, min(len(top), 6)):  # header sits a row or two below the label
+            if header_at(top[r], c0):
+                blocks.append((show_date, letter, r + 2))  # sheet row r+1 holds the headers
+                break
+        else:
+            problems.append(f"{_norm(text)!r} at column {letter} has no "
+                            f"'S/N | Name | Product...' header row under it")
+
+    if problems:
+        raise LayoutError("; ".join(problems))
+    if not blocks:
+        raise LayoutError(f"no 'DAY n (d Mon)' labels found in row 1 of '{SALES_TAB}'")
+
+    by_col = sorted(blocks, key=lambda b: col_to_index(b[1]))
+    for (_, l1, _), (_, l2, _) in zip(by_col, by_col[1:]):
+        if col_to_index(l2) - col_to_index(l1) < BLOCK_WIDTH:
+            raise LayoutError(f"the day blocks at columns {l1} and {l2} overlap "
+                              f"(each needs {BLOCK_WIDTH} columns)")
+
+    blocks.sort(key=lambda b: b[0])
+    return blocks
+
+def block_for(d, blocks):
+    """The block a given date writes into.
+
+    Dates before the show fall into the first day's block; dates after it, the last.
+    """
+    for b in blocks:
+        if d <= b[0]:
+            return b
+    return blocks[-1]
 
 def save_sale(name, product, delivery, preorder, qty=1, retries=3):
-    """Append qty rows to the column block for today's show day."""
+    """Append qty rows to the column block for today's show day.
+
+    Returns (day_label, None) when written, or (None, reason) when nothing was saved.
+    """
     tz = ZoneInfo("Asia/Singapore")
     now = datetime.now(tz)
-    timestamp = now.strftime("%-I:%M%p")  # e.g. 3:40PM, SG time
-    show_date, start_letter = block_for(now.date())
-    name_col = col_to_index(start_letter) + 1  # Name is the 2nd column of the block
+    # %-I is glibc-only, so build the 12-hour time by hand: e.g. 3:40PM, SG time
+    timestamp = f"{now.hour % 12 or 12}:{now.minute:02d}{now.strftime('%p')}"
+    last_error = "couldn't reach the sheet"
 
     for attempt in range(retries):
         try:
             ws = get_spreadsheet().worksheet(SALES_TAB)
 
-            data_start = find_data_start(ws, start_letter)
+            # Re-read the layout every time: a stale map is how sales get misplaced.
+            blocks = discover_blocks(ws)
+            show_date, start_letter, data_start = block_for(now.date(), blocks)
+            name_col = col_to_index(start_letter) + 1  # Name is the block's 2nd column
 
             # First free row in this block, based on its Name column
             existing = ws.col_values(name_col)
@@ -146,12 +205,17 @@ def save_sale(name, product, delivery, preorder, qty=1, retries=3):
             rows = [[sn + i, name, product, timestamp, delivery, preorder]
                     for i in range(qty)]
 
-            ws.update(block_range(start_letter, next_row, next_row + qty - 1), rows)
-            return day_label(show_date)
+            ws.update(rows, block_range(start_letter, next_row, next_row + qty - 1))
+            return day_label(show_date), None
+        except LayoutError as e:
+            # Retrying won't reshape the sheet - stop and say what's wrong.
+            logging.error(f"Sales Tracker layout check failed: {e}")
+            return None, f"the '{SALES_TAB}' tab doesn't look right - {e}"
         except Exception as e:
+            last_error = str(e)
             logging.warning(f"save_sale attempt {attempt+1} failed: {e}")
             time.sleep(2 * (attempt + 1))
-    return None
+    return None, last_error
 
 # ---------- Keyboard builder ----------
 def build_keyboard(items, prefix, per_row=1, add_cancel=True, add_back=None):
@@ -224,6 +288,29 @@ def preorder_screen(context, product, qty, delivery):
 # ---------- Handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Tap /sale to log a sale.")
+
+async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Verify the Sales Tracker layout without logging anything."""
+    try:
+        ws = get_spreadsheet().worksheet(SALES_TAB)
+        blocks = discover_blocks(ws)
+    except LayoutError as e:
+        await update.message.reply_text(f"⚠️ '{SALES_TAB}' looks wrong — {e}")
+        return
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Couldn't read the sheet: {e}")
+        return
+
+    today = datetime.now(ZoneInfo("Asia/Singapore")).date()
+    target = block_for(today, blocks)
+    lines = []
+    for show_date, letter, data_start in blocks:
+        end = index_to_col(col_to_index(letter) + BLOCK_WIDTH - 1)
+        mark = "  ← today" if (show_date, letter, data_start) == target else ""
+        lines.append(f"{day_label(show_date)}: {letter}–{end}, "
+                     f"rows from {data_start}{mark}")
+    await update.message.reply_text(
+        f"✅ {len(blocks)} day block(s) found, headers OK:\n\n" + "\n".join(lines))
 
 async def sale(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["sale"] = {}
@@ -322,8 +409,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = sale_data.get("name") or query.from_user.first_name
         qty = int(sale_data["qty"])
 
-        logged_day = save_sale(name, sale_data["product"],
-                               sale_data["delivery"], sale_data["preorder"], qty=qty)
+        logged_day, error = save_sale(name, sale_data["product"],
+                                      sale_data["delivery"], sale_data["preorder"],
+                                      qty=qty)
 
         if logged_day:
             await query.edit_message_text(
@@ -338,7 +426,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await query.edit_message_text(
-                "⚠️ Something went wrong saving. Please try /sale again."
+                f"⚠️ NOT saved — {error}\n\n"
+                "Nothing was written to the sheet, so log this sale by hand.\n"
+                "Tap /check once the sheet is fixed."
             )
         context.user_data["sale"] = {}
 
@@ -346,6 +436,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("sale", sale))
+    app.add_handler(CommandHandler("check", check))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, name_input))
     app.run_polling()
