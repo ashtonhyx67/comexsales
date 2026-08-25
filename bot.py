@@ -2,7 +2,7 @@ import logging
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, date
 from zoneinfo import ZoneInfo
 import gspread
 from google.oauth2.service_account import Credentials
@@ -16,6 +16,18 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_NAME = "Tradeshow Prints Marshall/Sonos (Sales Sheet)"
 PRODUCT_TAB = "COMEX Show 2026"
 SALES_TAB = "Sales Tracker"
+
+# ---------- Show-day layout ----------
+# Each show day gets its own 6-column block on the Sales Tracker tab, laid out by hand:
+#   a day label row, then the header row (S/N, Name, Product (Colour), Time,
+#   Delivery?, Pre-order?), then the sales rows beneath it.
+SHOW_DAYS = [
+    (date(2026, 9, 3), "A"),   # A - F
+    (date(2026, 9, 4), "H"),   # H - M
+    (date(2026, 9, 5), "O"),   # O - T
+    (date(2026, 9, 6), "V"),   # V - AA
+]
+BLOCK_WIDTH = 6  # S/N, Name, Product (Colour), Time, Delivery?, Pre-order?
 
 logging.basicConfig(level=logging.INFO)
 
@@ -62,52 +74,84 @@ def get_products(force=False):
         _cache_time = now
     return _products_cache
 
-DIVIDER_PREFIX = "──"
+# ---------- Column helpers ----------
+def col_to_index(letter):
+    """'A' -> 1, 'H' -> 8, 'AA' -> 27"""
+    idx = 0
+    for ch in letter.upper():
+        idx = idx * 26 + (ord(ch) - 64)
+    return idx
 
-def day_label(tz):
-    """e.g. '── WED 3 SEPT ──' for the current show day."""
-    now = datetime.now(tz)
-    return f"{DIVIDER_PREFIX} {now.strftime('%a').upper()} {now.day} {now.strftime('%b').upper()} {DIVIDER_PREFIX}"
+def index_to_col(idx):
+    """1 -> 'A', 8 -> 'H', 27 -> 'AA'"""
+    letters = ""
+    while idx > 0:
+        idx, rem = divmod(idx - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+def day_label(d):
+    """e.g. '3 SEPT (WED)'"""
+    month = d.strftime("%b").upper()
+    if month == "SEP":
+        month = "SEPT"
+    return f"{d.day} {month} ({d.strftime('%a').upper()})"
+
+def block_for(d):
+    """Return (show_date, start_column_letter) for the block a given date writes into.
+
+    Dates before the show fall into day 1's block; dates after it fall into day 4's.
+    """
+    for show_date, col in SHOW_DAYS:
+        if d <= show_date:
+            return show_date, col
+    return SHOW_DAYS[-1]
+
+def block_range(start_letter, row_start, row_end):
+    c0 = col_to_index(start_letter)
+    return f"{start_letter}{row_start}:{index_to_col(c0 + BLOCK_WIDTH - 1)}{row_end}"
+
+def find_data_start(ws, start_letter):
+    """Locate the row where a block's sales rows begin (the row after its header row).
+
+    Scans the top of the block for the header row (the one whose 2nd cell is 'Name'),
+    so it works whether the day label sits on one row above the headers or two.
+    """
+    top = ws.get(block_range(start_letter, 1, 6)) or []
+    for i, row in enumerate(top, start=1):
+        if len(row) > 1 and row[1].strip().lower().startswith("name"):
+            return i + 1
+    return 3  # fallback: label row 1, header row 2, data from row 3
 
 def save_sale(name, product, delivery, preorder, qty=1, retries=3):
-    """Write qty rows below the header, inserting a day divider when the date rolls over."""
+    """Append qty rows to the column block for today's show day."""
     tz = ZoneInfo("Asia/Singapore")
-    timestamp = datetime.now(tz).strftime("%-I:%M%p")  # e.g. 3:40PM, SG time
-    today = day_label(tz)
+    now = datetime.now(tz)
+    timestamp = now.strftime("%-I:%M%p")  # e.g. 3:40PM, SG time
+    show_date, start_letter = block_for(now.date())
+    name_col = col_to_index(start_letter) + 1  # Name is the 2nd column of the block
 
     for attempt in range(retries):
         try:
             ws = get_spreadsheet().worksheet(SALES_TAB)
 
-            # Find first empty row based on the Name column (B), header is row 1
-            names = ws.col_values(2)          # column B = Name
-            next_row = len(names) + 1
-            if next_row < 2:                  # safety: never write on the header
-                next_row = 2
+            data_start = find_data_start(ws, start_letter)
 
-            # Last day divider already written to the sheet, if any
-            last_divider = None
-            for v in reversed(names):
-                if v.strip().startswith(DIVIDER_PREFIX):
-                    last_divider = v.strip()
-                    break
+            # First free row in this block, based on its Name column
+            existing = ws.col_values(name_col)
+            next_row = max(len(existing) + 1, data_start)
 
-            rows = []
-            if last_divider != today:
-                if next_row > 2:              # blank spacer row between days
-                    rows.append(["", "", "", "", "", ""])
-                rows.append(["", today, "", "", "", ""])
+            # S/N restarts at 1 for each day block
+            sn = next_row - data_start + 1
+            rows = [[sn + i, name, product, timestamp, delivery, preorder]
+                    for i in range(qty)]
 
-            rows += [["", name, product, timestamp, delivery, preorder]
-                     for _ in range(qty)]
-
-            end_row = next_row + len(rows) - 1
-            ws.update(f"A{next_row}:F{end_row}", rows)
-            return True
+            ws.update(block_range(start_letter, next_row, next_row + qty - 1), rows)
+            return day_label(show_date)
         except Exception as e:
             logging.warning(f"save_sale attempt {attempt+1} failed: {e}")
             time.sleep(2 * (attempt + 1))
-    return False
+    return None
 
 # ---------- Keyboard builder ----------
 def build_keyboard(items, prefix, per_row=1, add_cancel=True, add_back=None):
@@ -278,17 +322,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = sale_data.get("name") or query.from_user.first_name
         qty = int(sale_data["qty"])
 
-        ok = save_sale(name, sale_data["product"],
-                       sale_data["delivery"], sale_data["preorder"], qty=qty)
+        logged_day = save_sale(name, sale_data["product"],
+                               sale_data["delivery"], sale_data["preorder"], qty=qty)
 
-        if ok:
+        if logged_day:
             await query.edit_message_text(
                 "Recorded ✅\n\n"
                 f"Promoter: {name}\n"
                 f"Product: {sale_data['product']}\n"
                 f"Qty: {qty}\n"
                 f"Delivery: {sale_data['delivery']}\n"
-                f"Pre-order: {sale_data['preorder']}\n\n"
+                f"Pre-order: {sale_data['preorder']}\n"
+                f"Logged to: {logged_day}\n\n"
                 "Tap /sale to log another."
             )
         else:
