@@ -8,7 +8,8 @@ import gspread
 from google.oauth2.service_account import Credentials
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, ContextTypes
+    Application, CommandHandler, CallbackQueryHandler, MessageHandler,
+    ContextTypes, filters
 )
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -61,10 +62,18 @@ def get_products(force=False):
         _cache_time = now
     return _products_cache
 
+DIVIDER_PREFIX = "──"
+
+def day_label(tz):
+    """e.g. '── WED 3 SEPT ──' for the current show day."""
+    now = datetime.now(tz)
+    return f"{DIVIDER_PREFIX} {now.strftime('%a').upper()} {now.day} {now.strftime('%b').upper()} {DIVIDER_PREFIX}"
+
 def save_sale(name, product, delivery, preorder, qty=1, retries=3):
-    """Write qty rows starting at the first empty row below the header."""
+    """Write qty rows below the header, inserting a day divider when the date rolls over."""
     tz = ZoneInfo("Asia/Singapore")
     timestamp = datetime.now(tz).strftime("%-I:%M%p")  # e.g. 3:40PM, SG time
+    today = day_label(tz)
 
     for attempt in range(retries):
         try:
@@ -76,11 +85,23 @@ def save_sale(name, product, delivery, preorder, qty=1, retries=3):
             if next_row < 2:                  # safety: never write on the header
                 next_row = 2
 
-            rows = [
-                ["", name, product, timestamp, delivery, preorder]
-                for _ in range(qty)
-            ]
-            end_row = next_row + qty - 1
+            # Last day divider already written to the sheet, if any
+            last_divider = None
+            for v in reversed(names):
+                if v.strip().startswith(DIVIDER_PREFIX):
+                    last_divider = v.strip()
+                    break
+
+            rows = []
+            if last_divider != today:
+                if next_row > 2:              # blank spacer row between days
+                    rows.append(["", "", "", "", "", ""])
+                rows.append(["", today, "", "", "", ""])
+
+            rows += [["", name, product, timestamp, delivery, preorder]
+                     for _ in range(qty)]
+
+            end_row = next_row + len(rows) - 1
             ws.update(f"A{next_row}:F{end_row}", rows)
             return True
         except Exception as e:
@@ -102,10 +123,26 @@ def build_keyboard(items, prefix, per_row=1, add_cancel=True, add_back=None):
     return InlineKeyboardMarkup(rows)
 
 # ---------- Screen renderers (so Back can redraw any step) ----------
+def name_prompt(context):
+    recent = context.user_data.get("recent_names", [])
+    text = "Who made this sale?\n\nType the promoter's name:"
+    rows = [[InlineKeyboardButton(n, callback_data=f"name:{n}"[:64])] for n in recent]
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel:x")])
+    if recent:
+        text += "\n\n(or tap a recent name below)"
+    return text, InlineKeyboardMarkup(rows)
+
+def remember_name(context, name):
+    recent = [n for n in context.user_data.get("recent_names", []) if n.lower() != name.lower()]
+    recent.insert(0, name)
+    context.user_data["recent_names"] = recent[:5]
+
 def brand_screen(context):
     products = context.user_data["all_products"]
     brands = sorted(set(p["brand"] for p in products))
-    return "Select a brand:", build_keyboard(brands, "brand", per_row=2, add_cancel=True)
+    promoter = context.user_data.get("sale", {}).get("name", "")
+    return (f"Promoter: {promoter}\n\nSelect a brand:",
+            build_keyboard(brands, "brand", per_row=2, add_cancel=True, add_back="name"))
 
 def category_screen(context, brand):
     products = context.user_data["all_products"]
@@ -147,6 +184,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def sale(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["sale"] = {}
     context.user_data["all_products"] = get_products()  # cached, fast
+    context.user_data["awaiting_name"] = True
+    text, markup = name_prompt(context)
+    await update.message.reply_text(text, reply_markup=markup)
+
+async def name_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manager types the promoter's name."""
+    if not context.user_data.get("awaiting_name"):
+        await update.message.reply_text("Tap /sale to log a sale.")
+        return
+    name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("Please type the promoter's name.")
+        return
+    context.user_data["awaiting_name"] = False
+    context.user_data.setdefault("sale", {})["name"] = name
+    remember_name(context, name)
+    if not context.user_data.get("all_products"):
+        context.user_data["all_products"] = get_products()
     text, markup = brand_screen(context)
     await update.message.reply_text(text, reply_markup=markup)
 
@@ -159,11 +214,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ----- Cancel -----
     if step == "cancel":
         context.user_data["sale"] = {}
+        context.user_data["awaiting_name"] = False
         await query.edit_message_text("Cancelled. Tap /sale to start again.")
         return
 
     # ----- Back -----
     if step == "back":
+        if value == "name":
+            context.user_data["awaiting_name"] = True
+            text, markup = name_prompt(context)
+            await query.edit_message_text(text, reply_markup=markup)
+            return
         if value == "brand":
             text, markup = brand_screen(context)
         elif value == "cat":
@@ -178,7 +239,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ----- Forward flow -----
-    if step == "brand":
+    if step == "name":
+        sale_data["name"] = value
+        context.user_data["awaiting_name"] = False
+        remember_name(context, sale_data["name"])
+        text, markup = brand_screen(context)
+        await query.edit_message_text(text, reply_markup=markup)
+
+    elif step == "brand":
         sale_data["brand"] = value
         text, markup = category_screen(context, value)
         await query.edit_message_text(text, reply_markup=markup)
@@ -207,7 +275,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif step == "preorder":
         sale_data["preorder"] = value
-        name = query.from_user.first_name
+        name = sale_data.get("name") or query.from_user.first_name
         qty = int(sale_data["qty"])
 
         ok = save_sale(name, sale_data["product"],
@@ -216,7 +284,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ok:
             await query.edit_message_text(
                 "Recorded ✅\n\n"
-                f"Name: {name}\n"
+                f"Promoter: {name}\n"
                 f"Product: {sale_data['product']}\n"
                 f"Qty: {qty}\n"
                 f"Delivery: {sale_data['delivery']}\n"
@@ -234,6 +302,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("sale", sale))
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, name_input))
     app.run_polling()
 
 if __name__ == "__main__":
