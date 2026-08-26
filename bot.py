@@ -41,8 +41,11 @@ LAYOUT_TTL = 300      # re-read the day-block map at most every 5 min
 PRODUCT_TTL = 600     # products don't change mid-show; serve stale, refresh behind
 FLUSH_WINDOW = 0.25   # coalesce sales arriving within this window into one write
 SHEET_TIMEOUT = 20    # don't let a hung Google request wedge the writer
-WRITE_RETRIES = 3
+WRITE_RETRIES = 3     # attempts within one round
+MAX_ROUNDS = 3        # rounds before a sale is declared lost and reported
+REQUEUE_DELAY = 5     # seconds before retrying a failed round (grows per round)
 MAX_BATCH = 50
+DRAIN_TIMEOUT = 60    # how long to keep writing after shutdown is requested
 
 
 class LayoutError(Exception):
@@ -302,28 +305,45 @@ def get_cursor(ws, letter, data_start):
     return _layout["cursors"][letter]
 
 
-# ---------- Batched writer ----------
-# Sales queue up here; one worker drains them, groups everything bound for the same
-# day block into a single contiguous range, and writes the whole burst in ONE API
-# call. 8 promoters x 5 items was ~200 Google round-trips; now it's a handful.
+# ---------- Background writer ----------
+# Sales queue up here and the promoter is confirmed immediately - nobody waits on
+# Google. One worker drains the queue, groups everything bound for the same day
+# block into a single contiguous range, and writes the whole burst in ONE API call.
+# 8 promoters x 5 items was ~200 Google round-trips; now it's a handful.
 _write_queue = None
+_app = None
+_pending = 0  # sales accepted but not yet on the sheet
 
 
 class _Sale:
     __slots__ = ("name", "product", "delivery", "preorder", "qty",
-                 "day", "clock", "future")
+                 "day", "clock", "chat_id", "tries")
 
-    def __init__(self, name, product, delivery, preorder, qty, now, future):
+    def __init__(self, name, product, delivery, preorder, qty, now, chat_id):
         self.name, self.product = name, product
         self.delivery, self.preorder = delivery, preorder
         self.qty = qty
         self.day = now.date()
         self.clock = clock(now)
-        self.future = future
+        self.chat_id = chat_id
+        self.tries = 0
+
+    def describe(self):
+        """Everything needed to write this row by hand."""
+        return (f"Promoter: {self.name}\n"
+                f"Product: {self.product}\n"
+                f"Qty: {self.qty}\n"
+                f"Delivery: {self.delivery}\n"
+                f"Pre-order: {self.preorder}\n"
+                f"Time: {self.clock}")
 
 
 def _write_batch(batch):
-    """Blocking - runs in a worker thread. Returns {index: (day_label, error)}."""
+    """Blocking - runs in a worker thread.
+
+    Returns {index: (day_label, error, retryable)}. A layout problem is not
+    retryable - the sheet has to be fixed by a human - but a 5xx or a timeout is.
+    """
     results = {}
     with _sheet_lock:
         try:
@@ -332,11 +352,11 @@ def _write_batch(batch):
         except LayoutError as e:
             logging.error(f"Sales Tracker layout check failed: {e}")
             reason = f"the '{SALES_TAB}' tab doesn't look right - {e}"
-            return {i: (None, reason) for i in range(len(batch))}
+            return {i: (None, reason, False) for i in range(len(batch))}
         except Exception as e:
             logging.warning(f"couldn't open the sheet: {e}")
             reset_sheet_cache()
-            return {i: (None, str(e)) for i in range(len(batch))}
+            return {i: (None, str(e), True) for i in range(len(batch))}
 
         # Group the burst by the day block each sale lands in.
         by_block = {}
@@ -350,7 +370,7 @@ def _write_batch(batch):
             except Exception as e:
                 logging.warning(f"couldn't find the next free row in column {letter}: {e}")
                 for i, _ in items:
-                    results[i] = (None, str(e))
+                    results[i] = (None, str(e), True)
                 continue
 
             rows, row = [], start
@@ -380,15 +400,37 @@ def _write_batch(batch):
                 _layout["cursors"][letter] = row
                 label = day_label(show_date)
                 for i, _ in items:
-                    results[i] = (label, None)
+                    results[i] = (label, None, False)
             else:
                 for i, _ in items:
-                    results[i] = (None, err)
+                    results[i] = (None, err, True)
     return results
+
+
+async def _requeue(sale):
+    """Nobody is waiting, so a failed sale can afford to sit and try again."""
+    await asyncio.sleep(REQUEUE_DELAY * sale.tries)
+    await _write_queue.put(sale)
+
+
+async def _report_failure(sale, err):
+    """The promoter already walked away, so the loss has to be pushed to them."""
+    logging.error(f"giving up on {sale.product} for {sale.name}: {err}")
+    if _app is None or sale.chat_id is None:
+        return
+    try:
+        await _app.bot.send_message(
+            sale.chat_id,
+            "⚠️ This sale did NOT reach the sheet — please add it by hand:\n\n"
+            f"{sale.describe()}\n\n"
+            f"Reason: {err}")
+    except Exception:
+        logging.exception("couldn't warn the chat about a lost sale")
 
 
 async def _writer_loop():
     """One consumer, so writes are serialised and rows can never collide."""
+    global _pending
     while True:
         try:
             first = await _write_queue.get()
@@ -401,11 +443,22 @@ async def _writer_loop():
                 results = await asyncio.to_thread(_write_batch, batch)
             except Exception as e:
                 logging.exception("batch write failed outright")
-                results = {i: (None, str(e)) for i in range(len(batch))}
+                results = {i: (None, str(e), True) for i in range(len(batch))}
 
             for i, s in enumerate(batch):
-                if not s.future.done():
-                    s.future.set_result(results.get(i, (None, "the write was dropped")))
+                _, err, retryable = results.get(
+                    i, (None, "the write was dropped", True))
+                if err is None:
+                    _pending -= 1
+                    continue
+                s.tries += 1
+                if retryable and s.tries < MAX_ROUNDS:
+                    logging.warning(f"requeueing {s.product} for {s.name} "
+                                    f"(round {s.tries} of {MAX_ROUNDS})")
+                    asyncio.create_task(_requeue(s))
+                else:
+                    _pending -= 1
+                    asyncio.create_task(_report_failure(s, err))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -413,15 +466,31 @@ async def _writer_loop():
             await asyncio.sleep(1)
 
 
-async def queue_sale(name, product, delivery, preorder, qty=1):
-    """Hand the sale to the writer and wait for it.
+def label_for_now(now=None):
+    """Today's day label straight from the cached layout - no Google call.
 
-    Returns (day_label, None) when written, or (None, reason) when nothing was saved.
+    Lets the confirmation name the right day block without waiting for the write.
     """
-    future = asyncio.get_running_loop().create_future()
+    blocks = _layout["blocks"]
+    if not blocks:
+        return None
+    now = now or datetime.now(ZoneInfo("Asia/Singapore"))
+    return day_label(block_for(now.date(), blocks)[0])
+
+
+def queue_sale(name, product, delivery, preorder, qty=1, chat_id=None):
+    """Accept the sale and return at once - the sheet catches up behind us.
+
+    Returns the day label this sale is bound for, or None if the layout isn't
+    known yet. Nothing here touches Google, so it can't make the promoter wait.
+    If the write ultimately fails, _report_failure warns the chat.
+    """
+    global _pending
     now = datetime.now(ZoneInfo("Asia/Singapore"))
-    await _write_queue.put(_Sale(name, product, delivery, preorder, qty, now, future))
-    return await future
+    _write_queue.put_nowait(
+        _Sale(name, product, delivery, preorder, qty, now, chat_id))
+    _pending += 1
+    return label_for_now(now)
 
 
 # ---------- Keyboard builder ----------
@@ -547,8 +616,11 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         next_row = _layout["cursors"].get(letter, data_start)
         lines.append(f"{day_label(show_date)}: {letter}–{end}, "
                      f"next row {next_row}{mark}")
+    queued = (f"\n\n⏳ {_pending} sale(s) still being written."
+              if _pending else "\n\nAll sales are on the sheet.")
     await update.message.reply_text(
-        f"✅ {len(blocks)} day block(s) found, headers OK:\n\n" + "\n".join(lines))
+        f"✅ {len(blocks)} day block(s) found, headers OK:\n\n"
+        + "\n".join(lines) + queued)
 
 
 async def sale(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -672,40 +744,37 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         delivery, preorder = sale_data["delivery"], value
         context.user_data["sale"] = {}
 
-        # Start the write first, then show "Saving" - the two overlap instead of
-        # queueing, so the confirmation lands as soon as the sheet acknowledges.
-        pending = asyncio.ensure_future(
-            queue_sale(name, product, delivery, preorder, qty=qty))
-        await edit(query, f"Saving {product} ×{qty}… ⏳")
-        logged_day, error = await pending
-
-        if logged_day:
-            await edit(query,
-                       "Recorded ✅\n\n"
-                       f"Promoter: {name}\n"
-                       f"Product: {product}\n"
-                       f"Qty: {qty}\n"
-                       f"Delivery: {delivery}\n"
-                       f"Pre-order: {preorder}\n"
-                       f"Logged to: {logged_day}",
-                       AGAIN_MARKUP)
-        else:
-            await edit(query,
-                       f"⚠️ NOT saved — {error}\n\n"
-                       "Nothing was written to the sheet, so log this sale by hand.\n"
-                       "Tap /check once the sheet is fixed.",
-                       AGAIN_MARKUP)
+        # Hand the sale to the background writer and confirm straight away. The
+        # promoter can start the next one immediately; the sheet catches up on its
+        # own time, and only shouts if a sale can't be written at all.
+        label = queue_sale(name, product, delivery, preorder, qty=qty,
+                           chat_id=query.message.chat_id)
+        await edit(query,
+                   "Recorded ✅\n\n"
+                   f"Promoter: {name}\n"
+                   f"Product: {product}\n"
+                   f"Qty: {qty}\n"
+                   f"Delivery: {delivery}\n"
+                   f"Pre-order: {preorder}\n"
+                   + (f"Logged to: {label}" if label else "Saving to the sheet…"),
+                   AGAIN_MARKUP)
 
 
 async def on_error(update, context):
     logging.error("handler error", exc_info=context.error)
 
 
+_writer_task = None
+
+
 async def post_init(app):
     """Warm every cache and start the writer before the first promoter taps /sale."""
-    global _write_queue
+    global _write_queue, _writer_task, _app
+    _app = app
     _write_queue = asyncio.Queue()
-    app.create_task(_writer_loop())
+    # Deliberately NOT app.create_task: Application.stop() awaits those, and this
+    # loop never returns, so registering it there would hang every shutdown.
+    _writer_task = asyncio.create_task(_writer_loop())
     try:
         await asyncio.to_thread(refresh_products)
         blocks = await asyncio.to_thread(get_blocks, True)
@@ -715,6 +784,24 @@ async def post_init(app):
         logging.warning(f"warm-up failed (will retry on first use): {e}")
 
 
+async def post_stop(app):
+    """Finish writing accepted sales before the process exits.
+
+    Sales are confirmed before they reach the sheet, so quitting with a full queue
+    would lose them silently. Give the writer a chance to land them.
+    """
+    if _pending:
+        logging.info(f"draining {_pending} pending sale(s) before shutdown")
+    deadline = time.time() + DRAIN_TIMEOUT
+    while _pending and time.time() < deadline:
+        await asyncio.sleep(0.2)
+    if _pending:
+        logging.error(f"{_pending} sale(s) STILL unwritten at shutdown - "
+                      f"check the sheet against Telegram")
+    if _writer_task:
+        _writer_task.cancel()
+
+
 def main():
     app = (Application.builder()
            .token(BOT_TOKEN)
@@ -722,6 +809,7 @@ def main():
            .connection_pool_size(64)      # enough sockets for 8 parallel flows
            .pool_timeout(30)
            .post_init(post_init)
+           .post_stop(post_stop)
            .build())
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("sale", sale))
