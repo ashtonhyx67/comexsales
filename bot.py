@@ -16,6 +16,13 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, MessageHandler,
     ContextTypes, filters
 )
+try:
+    # Queues and re-sends on HTTP 429 instead of raising. Eight promoters in one
+    # group can outrun Telegram's per-chat limit during a rush; without this the
+    # edit just fails and the promoter is left looking at a stale screen.
+    from telegram.ext import AIORateLimiter
+except ImportError:  # the [rate-limiter] extra isn't installed
+    AIORateLimiter = None
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_NAME = "Tradeshow Prints Marshall/Sonos (Sales Sheet)"
@@ -52,10 +59,12 @@ SGT = ZoneInfo("Asia/Singapore")
 LAYOUT_TTL = 300      # re-read the day-block map at most every 5 min
 PRODUCT_TTL = 600     # products don't change mid-show; serve stale, refresh behind
 FLUSH_WINDOW = 0.25   # coalesce sales arriving within this window into one write
+MIN_WRITE_INTERVAL = 1.1  # >=1s between writes: Sheets allows only 60/min/user
 SHEET_TIMEOUT = 20    # don't let a hung Google request wedge the writer
 WRITE_RETRIES = 3     # attempts within one round
-MAX_ROUNDS = 3        # rounds before a sale is declared lost and reported
-REQUEUE_DELAY = 5     # seconds before retrying a failed round (grows per round)
+MAX_ROUNDS = 8        # rounds before a sale is declared lost and reported
+REQUEUE_DELAY = 5     # first requeue wait; doubles each round, capped below
+MAX_REQUEUE_DELAY = 60   # ~5 min of retrying in total before giving up
 MAX_BATCH = 50
 DRAIN_TIMEOUT = 60    # how long to keep writing after shutdown is requested
 
@@ -387,20 +396,28 @@ def _name_col_range(block):
 
 
 def _sync_cursors(ws, blocks):
-    """Point each block's cursor at its first free row, never moving it backwards.
+    """Point each block's cursor at the sheet's first free row.
 
     One batch_get covering every day block, instead of one col_values call per
     block, and it starts at the block's own first data row so nothing above the
-    block counts. Anything a human parks BELOW the block still pushes the cursor
-    past it - deliberately, since skipping a row is safer than overwriting one.
+    block counts.
+
+    The cursor takes whatever the sheet says, including moving back UP: delete a
+    day's sales and the next one goes to the top of the block again. This is only
+    safe because of WHEN it runs - _write_batch calls get_blocks() first thing,
+    inside _sheet_lock and before any row is laid out, so at that moment every
+    written sale is already on the sheet and every accepted-but-unwritten one is
+    still in the queue. There is no in-flight row for a re-read to trample.
+
+    Anything a human parks BELOW the block still pushes the cursor past it, and a
+    gap left in the middle is skipped rather than filled - overwriting a row that
+    someone meant to keep is the one mistake worth avoiding at any cost.
     """
     if not blocks:
         return
     columns = ws.batch_get([_name_col_range(b) for b in blocks])
     for block, values in zip(blocks, columns):
-        from_sheet = block.data_start + len(values or [])
-        _layout["cursors"][block.letter] = max(
-            _layout["cursors"].get(block.letter, 0), from_sheet)
+        _layout["cursors"][block.letter] = block.data_start + len(values or [])
 
 
 def get_blocks(force=False):
@@ -431,6 +448,7 @@ def get_cursor(ws, block):
 _write_queue = None
 _app = None
 _pending = 0  # sales accepted but not yet on the sheet
+_last_write = 0.0  # monotonic clock of the last batch, for the quota guard
 
 
 class _Sale:
@@ -557,8 +575,13 @@ def _write_batch(batch):
 
 
 async def _requeue(sale):
-    """Nobody is waiting, so a failed sale can afford to sit and try again."""
-    await asyncio.sleep(REQUEUE_DELAY * sale.tries)
+    """Nobody is waiting, so a failed sale can afford to sit and try again.
+
+    Backs off 5s, 10s, 20s, 40s, then a minute at a time - roughly five minutes
+    of trying before the sale is declared lost and pushed to the chat by hand.
+    """
+    delay = min(REQUEUE_DELAY * 2 ** (sale.tries - 1), MAX_REQUEUE_DELAY)
+    await asyncio.sleep(delay)
     await _write_queue.put(sale)
 
 
@@ -581,15 +604,22 @@ async def _report_failure(sale, err):
 
 async def _writer_loop():
     """One consumer, so writes are serialised and rows can never collide."""
-    global _pending
+    global _pending, _last_write
     while True:
         try:
             first = await _write_queue.get()
             await asyncio.sleep(FLUSH_WINDOW)  # let the rest of the burst pile in
+            # Stay under the API's 60-writes-a-minute ceiling. Waiting costs the
+            # promoter nothing (they were confirmed long ago) and the extra time
+            # only makes the next batch bigger, which is cheaper per sale.
+            behind = MIN_WRITE_INTERVAL - (time.monotonic() - _last_write)
+            if behind > 0:
+                await asyncio.sleep(behind)
             batch = [first]
             while not _write_queue.empty() and len(batch) < MAX_BATCH:
                 batch.append(_write_queue.get_nowait())
 
+            _last_write = time.monotonic()
             try:
                 results = await asyncio.to_thread(_write_batch, batch)
             except Exception as e:
@@ -681,7 +711,12 @@ BUNDLES = {
 
 # The Bundles entry sits alongside the brands on the first product screen, so a
 # promoter reaches a bundle in the same number of taps as anything else.
-BUNDLE_MENU_LABEL = "🎁 Bundles"
+# The first thing a promoter picks. Splitting this out of the brand list keeps
+# the two paths from being confused with one another - a bundle is a different
+# kind of sale, not another brand.
+KIND_BUNDLE = "🎁 Bundle"
+KIND_INDIVIDUAL = "🎧 Individual"
+KIND_CHOICES = [KIND_BUNDLE, KIND_INDIVIDUAL]
 MIX_LABEL = "🎨 Mix colours…"
 
 
@@ -815,15 +850,21 @@ def remember_name(context, name):
     context.user_data["recent_names"] = recent[:5]
 
 
+def kind_screen(context):
+    """Bundle or individual item - the first thing after the promoter's name."""
+    promoter = context.user_data.get("sale", {}).get("name", "")
+    return (f"Promoter: {promoter}\n\nBundle or individual item?",
+            build_keyboard(KIND_CHOICES, "kind", per_row=2,
+                           add_cancel=True, add_back="name"))
+
+
 def brand_screen(context):
-    # Bundles sit at the front of the same menu rather than behind a separate
-    # command: it's one screen a promoter is already looking at, and a bundle is
-    # then the same number of taps as a single product.
-    entries = ([BUNDLE_MENU_LABEL] if BUNDLES else []) + context.user_data["catalog"]["brands"]
-    context.user_data["brands"] = entries
+    brands = context.user_data["catalog"]["brands"]
+    context.user_data["brands"] = brands
     promoter = context.user_data.get("sale", {}).get("name", "")
     return (f"Promoter: {promoter}\n\nSelect a brand:",
-            build_keyboard(entries, "brand", per_row=2, add_cancel=True, add_back="name"))
+            build_keyboard(brands, "brand", per_row=2, add_cancel=True,
+                           add_back="kind" if BUNDLES else "name"))
 
 
 def bundle_screen(context):
@@ -832,7 +873,16 @@ def bundle_screen(context):
     listing = "\n\n".join(f"• {name}\n{bundle_summary(name, indent='   ')}"
                           for name in names)
     return ("Select a bundle:\n\n" + listing,
-            build_keyboard(names, "bundle", per_row=1, add_cancel=True, add_back="brand"))
+            build_keyboard(names, "bundle", per_row=1, add_cancel=True, add_back="kind"))
+
+
+def first_screen(context):
+    """Where a flow goes once the promoter's name is known.
+
+    Straight to the brands when no bundles are configured, so the extra tap only
+    exists when there is actually a choice to make.
+    """
+    return kind_screen(context) if BUNDLES else brand_screen(context)
 
 
 def colour_screen(context, bundle):
@@ -932,7 +982,7 @@ def fixed(options, value):
 
 async def restart_flow(query, context, note):
     """A stale or unresolvable button: say so and put the promoter back at step 1."""
-    context.user_data["sale"] = {}
+    context.user_data.setdefault("sale", {}).clear()
     context.user_data["awaiting_name"] = True
     context.user_data["catalog"] = await get_catalog()
     text, markup = name_prompt(context)
@@ -969,6 +1019,8 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      f"next row {next_row}{mark}{note}")
     queued = (f"\n\n⏳ {_pending} sale(s) still being written."
               if _pending else "\n\nAll sales are on the sheet.")
+    queued += (f"\n(Row positions re-read just now; otherwise refreshed every "
+               f"{LAYOUT_TTL // 60} min — run /check after editing the sheet.)")
 
     problems = bundle_problems(await get_catalog())
     if problems:
@@ -986,7 +1038,7 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def sale(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["sale"] = {}
+    context.user_data.setdefault("sale", {}).clear()
     context.user_data["catalog"] = await get_catalog()  # cached, no wait
     context.user_data["awaiting_name"] = True
     text, markup = name_prompt(context)
@@ -1011,7 +1063,7 @@ async def name_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     remember_name(context, name)
     if not context.user_data.get("catalog"):
         context.user_data["catalog"] = await get_catalog()
-    text, markup = brand_screen(context)
+    text, markup = first_screen(context)
     msg = await update.message.reply_text(text, reply_markup=markup)
     context.user_data["flow_msg"] = msg.message_id
 
@@ -1030,7 +1082,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ----- Cancel -----
     if step == "cancel":
-        context.user_data["sale"] = {}
+        sale_data.clear()
         context.user_data["awaiting_name"] = False
         await edit(query, "Cancelled.", AGAIN_MARKUP)
         return
@@ -1054,6 +1106,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if value == "name":
                 context.user_data["awaiting_name"] = True
                 text, markup = name_prompt(context)
+            elif value == "kind":
+                text, markup = kind_screen(context)
             elif value == "brand":
                 text, markup = brand_screen(context)
             elif value == "cat":
@@ -1102,16 +1156,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sale_data["name"] = name
         context.user_data["awaiting_name"] = False
         remember_name(context, name)
-        text, markup = brand_screen(context)
+        text, markup = first_screen(context)
+        await edit(query, text, markup)
+
+    elif step == "kind":
+        choice = fixed(KIND_CHOICES, value)
+        if choice is None:
+            await restart_flow(query, context, "That menu is out of date — starting over.")
+            return
+        if choice == KIND_BUNDLE and BUNDLES:
+            sale_data.pop("product", None)
+            text, markup = bundle_screen(context)
+        else:
+            sale_data.pop("bundle", None)
+            sale_data.pop("colours", None)
+            text, markup = brand_screen(context)
         await edit(query, text, markup)
 
     elif step == "brand":
         brand = pick(context, "brands", value)
-        if brand == BUNDLE_MENU_LABEL and BUNDLES:
-            sale_data.pop("product", None)
-            text, markup = bundle_screen(context)
-            await edit(query, text, markup)
-            return
         if brand is None or brand not in context.user_data["catalog"]["tree"]:
             await restart_flow(query, context, "That menu is out of date — starting over.")
             return
@@ -1154,9 +1217,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if colour is None or bundle not in BUNDLES or chosen is None:
             await restart_flow(query, context, "That menu is out of date — starting over.")
             return
-        chosen = chosen + [colour]
-        sale_data["colours"] = chosen
-        if len(chosen) < len(BUNDLES[bundle]):
+        wanted = len(BUNDLES[bundle])
+        if len(chosen) < wanted:
+            # Guarded: a double tap used to append twice and silently give the
+            # NEXT item the same colour without ever asking about it.
+            chosen = chosen + [colour]
+            sale_data["colours"] = chosen
+        if len(chosen) < wanted:
             text, markup = mix_screen(context, bundle, chosen)
         else:
             text, markup = qty_screen(context, None, bundle)
@@ -1210,7 +1277,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if bundle and len(colours) != len(BUNDLES.get(bundle, ())):
             await restart_flow(query, context, "Colours weren't finished — starting over.")
             return
-        context.user_data["sale"] = {}
+        # Emptied in place, with no await between the checks above and here, so a
+        # second tap arriving in the same instant finds nothing left to submit.
+        sale_data.clear()
 
         # A bundle expands into one line per product, multiplied by how many of
         # the bundle were sold; a normal sale is just the single product. Either
@@ -1308,14 +1377,19 @@ async def post_stop(app):
 
 
 def main():
-    app = (Application.builder()
-           .token(BOT_TOKEN)
-           .concurrent_updates(True)      # promoters no longer queue behind each other
-           .connection_pool_size(64)      # enough sockets for 8 parallel flows
-           .pool_timeout(30)
-           .post_init(post_init)
-           .post_stop(post_stop)
-           .build())
+    builder = (Application.builder()
+               .token(BOT_TOKEN)
+               .concurrent_updates(True)  # promoters no longer queue behind each other
+               .connection_pool_size(64)  # enough sockets for 8 parallel flows
+               .pool_timeout(30)
+               .post_init(post_init)
+               .post_stop(post_stop))
+    if AIORateLimiter is not None:
+        builder = builder.rate_limiter(AIORateLimiter())
+    else:
+        logging.warning("no rate limiter: pip install 'python-telegram-bot[rate-limiter]' "
+                        "to ride out Telegram's flood limits during a rush")
+    app = builder.build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("sale", sale))
     app.add_handler(CommandHandler("check", check))

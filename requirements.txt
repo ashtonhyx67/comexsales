@@ -1,7 +1,7 @@
 # Pinned on purpose: gspread 6 changed ws.update() to (values, range_name) and
 # python-telegram-bot 20 introduced the async Application builder. An unpinned
 # redeploy mid-show that pulls a major bump would break every write.
-python-telegram-bot>=22,<23
+python-telegram-bot[rate-limiter]>=22,<23
 gspread>=6.2,<7
 google-auth>=2.35,<3
 # ZoneInfo("Asia/Singapore") raises on slim/alpine images with no system tz data.
