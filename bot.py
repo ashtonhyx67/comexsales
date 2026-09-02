@@ -29,8 +29,13 @@ SALES_TAB = "Sales Tracker"
 # The layout is read off the sheet rather than hardcoded, so an inserted column
 # or an extra day block can't silently send sales to the wrong place.
 SHOW_YEAR = 2026  # the day labels carry no year
-BLOCK_WIDTH = 6   # S/N, Name, Product (Colour), Time, Delivery?, Pre-order?
-EXPECTED_HEADERS = ["s/n", "name", "product", "time", "delivery", "pre-order"]
+# Every block opens with these four, in this order, then carries one or more
+# "flag" columns. Which flags, and in what order, is read off each block's own
+# header row: day 1 has Cash & Carry | Delivery? | Pre-order? while the other
+# days still have only Delivery? | Pre-order?, and both have to work.
+CORE_HEADERS = ["s/n", "name", "product", "time"]
+REQUIRED_FLAGS = ("delivery", "preorder")   # a block without these is malformed
+FLAG_NAMES = {"cash": "Cash & Carry", "delivery": "Delivery?", "preorder": "Pre-order?"}
 DAY_LABEL_RE = re.compile(r"^\s*DAY\s*\d+\s*\(\s*(\d{1,2})\s*([A-Za-z]+)", re.I)
 MONTHS = ["jan", "feb", "mar", "apr", "may", "jun",
           "jul", "aug", "sep", "oct", "nov", "dec"]
@@ -206,9 +211,9 @@ def day_label(d):
     return f"{d.day} {month} ({d.strftime('%a').upper()})"
 
 
-def block_range(start_letter, row_start, row_end):
+def block_range(start_letter, row_start, row_end, width):
     c0 = col_to_index(start_letter)
-    return f"{start_letter}{row_start}:{index_to_col(c0 + BLOCK_WIDTH - 1)}{row_end}"
+    return f"{start_letter}{row_start}:{index_to_col(c0 + width - 1)}{row_end}"
 
 
 def clock(now):
@@ -235,18 +240,51 @@ def parse_day_label(text):
         return None
 
 
+def flag_kind(text):
+    """Which flag column a header cell is, or None if it isn't one."""
+    t = _norm(text)
+    if t.startswith("cash"):
+        return "cash"
+    if t.startswith("delivery"):
+        return "delivery"
+    if t.startswith("pre-order") or t.startswith("pre order") or t.startswith("preorder"):
+        return "preorder"
+    return None
+
+
 def header_at(row, c0):
-    """True if the BLOCK_WIDTH cells starting at 0-based column c0 are the block headers."""
-    cells = [row[i] if i < len(row) else "" for i in range(c0, c0 + BLOCK_WIDTH)]
-    return all(_norm(c).startswith(h) for c, h in zip(cells, EXPECTED_HEADERS))
+    """The block's flag columns if a header row starts at 0-based column c0.
+
+    Returns e.g. ("cash", "delivery", "preorder") for day 1 and
+    ("delivery", "preorder") for the others; None if this isn't a header row.
+    The flags are taken in the order they appear, so inserting Cash & Carry in
+    the middle of a block moves the value, not the meaning.
+    """
+    def cell(i):
+        return row[i] if i < len(row) else ""
+
+    if not all(_norm(cell(c0 + i)).startswith(h) for i, h in enumerate(CORE_HEADERS)):
+        return None
+    flags = []
+    for i in range(c0 + len(CORE_HEADERS), len(row)):
+        kind = flag_kind(cell(i))
+        if kind is None or kind in flags:
+            break
+        flags.append(kind)
+    return tuple(flags) or None
 
 
 class Block(NamedTuple):
-    """One show day's 6-column strip on the Sales Tracker tab."""
+    """One show day's strip of columns on the Sales Tracker tab."""
     show_date: date     # the day the block is for
-    letter: str         # its first column ("A", "H", ...)
+    letter: str         # its first column ("A", "I", ...)
     data_start: int     # first sheet row of sales data
     label: str          # the sheet's own label text, e.g. "DAY 1 (3 Sept)"
+    flags: tuple        # flag columns in sheet order, e.g. ("cash", "delivery", "preorder")
+
+    @property
+    def width(self):
+        return len(CORE_HEADERS) + len(self.flags)
 
 
 def discover_blocks(ws):
@@ -265,9 +303,17 @@ def discover_blocks(ws):
             continue
         letter = index_to_col(c0 + 1)
         for r in range(1, min(len(top), 6)):  # header sits a row or two below the label
-            if header_at(top[r], c0):
+            flags = header_at(top[r], c0)
+            if flags:
+                missing = [f for f in REQUIRED_FLAGS if f not in flags]
+                if missing:
+                    problems.append(
+                        f"{_norm(text)!r} at column {letter} has no "
+                        + " or ".join(FLAG_NAMES[f] for f in missing) + " column")
+                    break
                 # sheet row r+1 holds the headers, so data starts at r+2
-                blocks.append(Block(show_date, letter, r + 2, " ".join(text.split())))
+                blocks.append(Block(show_date, letter, r + 2,
+                                    " ".join(text.split()), flags))
                 break
         else:
             problems.append(f"{_norm(text)!r} at column {letter} has no "
@@ -280,9 +326,9 @@ def discover_blocks(ws):
 
     by_col = sorted(blocks, key=lambda b: col_to_index(b.letter))
     for b1, b2 in zip(by_col, by_col[1:]):
-        if col_to_index(b2.letter) - col_to_index(b1.letter) < BLOCK_WIDTH:
+        if col_to_index(b2.letter) - col_to_index(b1.letter) < b1.width:
             raise LayoutError(f"the day blocks at columns {b1.letter} and {b2.letter} "
-                              f"overlap (each needs {BLOCK_WIDTH} columns)")
+                              f"overlap ({b1.label} needs {b1.width} columns)")
 
     blocks.sort(key=lambda b: b.show_date)
     # Two blocks for the same date would make the target ambiguous and silently
@@ -374,13 +420,15 @@ class _Sale:
     thing succeeds or fails together - a promoter can't end up with two of the
     three bundle items on the sheet and no idea which one is missing.
     """
-    __slots__ = ("name", "lines", "delivery", "preorder", "bundle",
+    __slots__ = ("name", "lines", "bundle", "fulfilment",
                  "day", "clock", "chat_id", "tries")
 
-    def __init__(self, name, lines, delivery, preorder, now, chat_id, bundle=None):
+    def __init__(self, name, lines, fulfilment, now, chat_id, bundle=None):
         self.name = name
         self.lines = tuple(lines)   # ((product, count), ...) - one row per count
-        self.delivery, self.preorder = delivery, preorder
+        # The choice is kept as-is and turned into cells at write time, because
+        # which columns exist differs from one day block to the next.
+        self.fulfilment = fulfilment         # "Delivery" / "Pre-Order" / "Cash & Carry"
         self.bundle = bundle        # bundle name, or None for a single product
         self.day = now.date()
         self.clock = clock(now)
@@ -404,8 +452,7 @@ class _Sale:
         """Everything needed to write these rows by hand."""
         return (f"Promoter: {self.name}\n"
                 f"{self.summary()}\n"
-                f"Delivery: {self.delivery}\n"
-                f"Pre-order: {self.preorder}\n"
+                f"{self.fulfilment}\n"
                 f"Time: {self.clock}")
 
 
@@ -453,14 +500,15 @@ def _write_batch(batch):
                 # A bundle contributes one row per unit of each of its products,
                 # written exactly like individually-logged sales, so unit counts
                 # and the sheet's pre-printed S/N column stay in step.
+                cells = flag_cells(s.fulfilment, block.flags)
                 for product, count in s.lines:
                     for _ in range(count):
                         # S/N restarts at 1 for each day block
                         rows.append([row - block.data_start + 1, s.name, product,
-                                     s.clock, s.delivery, s.preorder])
+                                     s.clock] + cells)
                         row += 1
 
-            rng = block_range(block.letter, start, row - 1)
+            rng = block_range(block.letter, start, row - 1, block.width)
             writes.append({"range": rng, "values": rows})
             planned.append((block, row, items, rng))
 
@@ -564,7 +612,7 @@ def label_for_now(now=None):
     return block_for(now.date(), blocks).label
 
 
-def queue_sale(name, lines, delivery, preorder, chat_id=None, bundle=None):
+def queue_sale(name, lines, fulfilment, chat_id=None, bundle=None):
     """Accept the sale and return at once - the sheet catches up behind us.
 
     `lines` is [(product, count), ...] - a single product for a normal sale, or
@@ -576,7 +624,7 @@ def queue_sale(name, lines, delivery, preorder, chat_id=None, bundle=None):
     global _pending
     now = datetime.now(SGT)
     _write_queue.put_nowait(
-        _Sale(name, lines, delivery, preorder, now, chat_id, bundle))
+        _Sale(name, lines, fulfilment, now, chat_id, bundle))
     _pending += 1
     return label_for_now(now)
 
@@ -671,6 +719,34 @@ def bundle_problems(catalog):
 # addressed by index now, and the labels live in user_data.
 QTY_CHOICES = [1, 2, 3, 4, 5]
 YES_NO = ["Yes", "No"]
+
+# How the sale is fulfilled - one question instead of the old Delivery? then
+# Pre-order? pair, because the three cases are mutually exclusive in practice.
+# The Sales Tracker still has its two Yes/No columns and they are untouched, so
+# nothing downstream has to change: each choice writes a distinct pair, and
+# Cash & Carry is the "neither" the sheet already used for a walk-out sale.
+#   (button label, short name)
+FULFILMENTS = [
+    ("🚚 Delivery", "Delivery"),
+    ("📦 Pre-Order", "Pre-Order"),
+    ("🛍 Cash & Carry", "Cash & Carry"),
+]
+
+# What each choice writes into each flag column. A block that hasn't got a given
+# column simply doesn't get that value - which is why Cash & Carry still reads
+# correctly on the day blocks that only have Delivery? and Pre-order?: it is the
+# "No to both" those two columns already meant.
+FULFILMENT_CELLS = {
+    "Delivery": {"cash": "No", "delivery": "Yes", "preorder": "No"},
+    "Pre-Order": {"cash": "No", "delivery": "No", "preorder": "Yes"},
+    "Cash & Carry": {"cash": "Yes", "delivery": "No", "preorder": "No"},
+}
+
+
+def flag_cells(fulfilment, flags):
+    """The flag-column values for this sale, in one block's column order."""
+    cells = FULFILMENT_CELLS.get(fulfilment, {})
+    return [cells.get(flag, "") for flag in flags]
 
 
 def build_keyboard(items, prefix, per_row=1, add_cancel=True, add_back=None):
@@ -801,17 +877,10 @@ def _what(context, product, qty, bundle=None):
     return f"Bundle: {bundle} × {qty}\n{bundle_summary(bundle, colours)}"
 
 
-def delivery_screen(context, product, qty, bundle=None):
-    return (f"{_what(context, product, qty, bundle)}\n\nDelivery?",
-            build_keyboard(YES_NO, "delivery", per_row=2,
+def fulfilment_screen(context, product, qty, bundle=None):
+    return (f"{_what(context, product, qty, bundle)}\n\nHow is it going out?",
+            build_keyboard([f[0] for f in FULFILMENTS], "fulfil", per_row=1,
                            add_cancel=True, add_back="qty"))
-
-
-def preorder_screen(context, product, qty, delivery, bundle=None):
-    return (f"{_what(context, product, qty, bundle)}\nDelivery: {delivery}\n\n"
-            f"Pre-order?",
-            build_keyboard(YES_NO, "preorder", per_row=2,
-                           add_cancel=True, add_back="delivery"))
 
 
 AGAIN_MARKUP = InlineKeyboardMarkup(
@@ -872,11 +941,13 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target = block_for(today, blocks)
     lines = []
     for b in blocks:
-        end = index_to_col(col_to_index(b.letter) + BLOCK_WIDTH - 1)
+        end = index_to_col(col_to_index(b.letter) + b.width - 1)
         mark = "  ← today" if b == target else ""
         next_row = _layout["cursors"].get(b.letter, b.data_start)
-        lines.append(f"{b.label} ({day_label(b.show_date)}): {b.letter}–{end}, "
-                     f"next row {next_row}{mark}")
+        cols = ", ".join(FLAG_NAMES[f] for f in b.flags)
+        note = "" if "cash" in b.flags else "  ⚠️ no Cash & Carry column"
+        lines.append(f"{b.label} ({day_label(b.show_date)}): {b.letter}–{end} "
+                     f"[{cols}], next row {next_row}{mark}{note}")
     queued = (f"\n\n⏳ {_pending} sale(s) still being written."
               if _pending else "\n\nAll sales are on the sheet.")
 
@@ -988,10 +1059,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif value == "qty":
                 text, markup = qty_screen(context, sale_data.get("product"),
                                           sale_data.get("bundle"))
-            elif value == "delivery":
-                text, markup = delivery_screen(context, sale_data.get("product"),
-                                               sale_data["qty"],
-                                               sale_data.get("bundle"))
+            elif value == "fulfil":
+                text, markup = fulfilment_screen(context, sale_data.get("product"),
+                                                 sale_data["qty"],
+                                                 sale_data.get("bundle"))
             else:
                 return
         except KeyError:
@@ -1101,49 +1172,39 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await restart_flow(query, context, "Colours weren't finished — starting over.")
             return
         sale_data["qty"] = qty
-        text, markup = delivery_screen(context, sale_data.get("product"), qty,
-                                       sale_data.get("bundle"))
+        text, markup = fulfilment_screen(context, sale_data.get("product"), qty,
+                                         sale_data.get("bundle"))
         await edit(query, text, markup)
 
-    elif step == "delivery":
-        answer = fixed(YES_NO, value)
-        if answer is None or "qty" not in sale_data:
+    elif step == "fulfil":
+        choice = fixed(FULFILMENTS, value)
+        if choice is None or "qty" not in sale_data:
             await restart_flow(query, context, "That menu is out of date — starting over.")
             return
-        sale_data["delivery"] = answer
-        text, markup = preorder_screen(context, sale_data.get("product"),
-                                       sale_data["qty"], answer,
-                                       sale_data.get("bundle"))
-        await edit(query, text, markup)
+        _, fulfilment = choice
 
-    elif step == "preorder":
-        answer = fixed(YES_NO, value)
-        if answer is None or "delivery" not in sale_data:
-            await restart_flow(query, context, "That menu is out of date — starting over.")
-            return
         name = sale_data.get("name") or query.from_user.first_name
         bundle = sale_data.get("bundle")
         product = sale_data.get("product")
-        sale_data_colours = sale_data.get("colours") or []
+        colours = sale_data.get("colours") or []
         qty = int(sale_data["qty"])
-        if bundle and len(sale_data_colours) != len(BUNDLES.get(bundle, ())):
+        if bundle and len(colours) != len(BUNDLES.get(bundle, ())):
             await restart_flow(query, context, "Colours weren't finished — starting over.")
             return
-        delivery, preorder = sale_data["delivery"], answer
         context.user_data["sale"] = {}
 
         # A bundle expands into one line per product, multiplied by how many of
         # the bundle were sold; a normal sale is just the single product. Either
         # way it goes to the writer as ONE sale, so it lands (or fails) whole.
         if bundle:
-            lines = bundle_lines(bundle, sale_data_colours, qty)
+            lines = bundle_lines(bundle, colours, qty)
         else:
             lines = [(product, qty)]
 
         # Hand the sale to the background writer and confirm straight away. The
         # promoter can start the next one immediately; the sheet catches up on its
         # own time, and only shouts if a sale can't be written at all.
-        label = queue_sale(name, lines, delivery, preorder,
+        label = queue_sale(name, lines, fulfilment,
                            chat_id=query.message.chat_id, bundle=bundle)
         rows = sum(count for _, count in lines)
         if bundle:
@@ -1156,8 +1217,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                    "Recorded ✅\n\n"
                    f"Promoter: {name}\n"
                    f"{what}"
-                   f"Delivery: {delivery}\n"
-                   f"Pre-order: {preorder}\n"
+                   f"{fulfilment}\n"
                    + (f"Logged to: {label}" if label else "Saving to the sheet…"),
                    AGAIN_MARKUP)
 
