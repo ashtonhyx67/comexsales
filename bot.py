@@ -368,23 +368,42 @@ _pending = 0  # sales accepted but not yet on the sheet
 
 
 class _Sale:
-    __slots__ = ("name", "product", "delivery", "preorder", "qty",
+    """One transaction: a single product, or every product in a bundle.
+
+    A bundle is held as ONE _Sale rather than split into several, so the whole
+    thing succeeds or fails together - a promoter can't end up with two of the
+    three bundle items on the sheet and no idea which one is missing.
+    """
+    __slots__ = ("name", "lines", "delivery", "preorder", "bundle",
                  "day", "clock", "chat_id", "tries")
 
-    def __init__(self, name, product, delivery, preorder, qty, now, chat_id):
-        self.name, self.product = name, product
+    def __init__(self, name, lines, delivery, preorder, now, chat_id, bundle=None):
+        self.name = name
+        self.lines = tuple(lines)   # ((product, count), ...) - one row per count
         self.delivery, self.preorder = delivery, preorder
-        self.qty = qty
+        self.bundle = bundle        # bundle name, or None for a single product
         self.day = now.date()
         self.clock = clock(now)
         self.chat_id = chat_id
         self.tries = 0
 
+    @property
+    def units(self):
+        """How many sheet rows this sale becomes."""
+        return sum(count for _, count in self.lines)
+
+    def summary(self):
+        """The product line(s) for a confirmation or a failure notice."""
+        items = "\n".join(f"  • {count} × {product}" for product, count in self.lines)
+        if self.bundle:
+            return f"Bundle: {self.bundle}\n{items}"
+        product, count = self.lines[0]
+        return f"Product: {product}\nQty: {count}"
+
     def describe(self):
-        """Everything needed to write this row by hand."""
+        """Everything needed to write these rows by hand."""
         return (f"Promoter: {self.name}\n"
-                f"Product: {self.product}\n"
-                f"Qty: {self.qty}\n"
+                f"{self.summary()}\n"
                 f"Delivery: {self.delivery}\n"
                 f"Pre-order: {self.preorder}\n"
                 f"Time: {self.clock}")
@@ -431,11 +450,15 @@ def _write_batch(batch):
 
             rows, row = [], start
             for _, s in items:
-                for _ in range(s.qty):
-                    # S/N restarts at 1 for each day block
-                    rows.append([row - block.data_start + 1, s.name, s.product,
-                                 s.clock, s.delivery, s.preorder])
-                    row += 1
+                # A bundle contributes one row per unit of each of its products,
+                # written exactly like individually-logged sales, so unit counts
+                # and the sheet's pre-printed S/N column stay in step.
+                for product, count in s.lines:
+                    for _ in range(count):
+                        # S/N restarts at 1 for each day block
+                        rows.append([row - block.data_start + 1, s.name, product,
+                                     s.clock, s.delivery, s.preorder])
+                        row += 1
 
             rng = block_range(block.letter, start, row - 1)
             writes.append({"range": rng, "values": rows})
@@ -475,13 +498,15 @@ async def _requeue(sale):
 
 async def _report_failure(sale, err):
     """The promoter already walked away, so the loss has to be pushed to them."""
-    logging.error(f"giving up on {sale.product} for {sale.name}: {err}")
+    logging.error(f"giving up on {sale.bundle or sale.lines[0][0]} "
+                  f"for {sale.name}: {err}")
     if _app is None or sale.chat_id is None:
         return
     try:
         await _app.bot.send_message(
             sale.chat_id,
-            "⚠️ This sale did NOT reach the sheet — please add it by hand:\n\n"
+            f"⚠️ This sale did NOT reach the sheet — please add "
+            f"{'these rows' if sale.units > 1 else 'it'} by hand:\n\n"
             f"{sale.describe()}\n\n"
             f"Reason: {err}")
     except Exception:
@@ -513,7 +538,8 @@ async def _writer_loop():
                     continue
                 s.tries += 1
                 if retryable and s.tries < MAX_ROUNDS:
-                    logging.warning(f"requeueing {s.product} for {s.name} "
+                    logging.warning(f"requeueing {s.bundle or s.lines[0][0]} "
+                                    f"for {s.name} "
                                     f"(round {s.tries} of {MAX_ROUNDS})")
                     asyncio.create_task(_requeue(s))
                 else:
@@ -538,19 +564,103 @@ def label_for_now(now=None):
     return block_for(now.date(), blocks).label
 
 
-def queue_sale(name, product, delivery, preorder, qty=1, chat_id=None):
+def queue_sale(name, lines, delivery, preorder, chat_id=None, bundle=None):
     """Accept the sale and return at once - the sheet catches up behind us.
 
-    Returns the day label this sale is bound for, or None if the layout isn't
-    known yet. Nothing here touches Google, so it can't make the promoter wait.
-    If the write ultimately fails, _report_failure warns the chat.
+    `lines` is [(product, count), ...] - a single product for a normal sale, or
+    every product in a bundle. Returns the day label this sale is bound for, or
+    None if the layout isn't known yet. Nothing here touches Google, so it can't
+    make the promoter wait. If the write ultimately fails, _report_failure warns
+    the chat.
     """
     global _pending
     now = datetime.now(SGT)
     _write_queue.put_nowait(
-        _Sale(name, product, delivery, preorder, qty, now, chat_id))
+        _Sale(name, lines, delivery, preorder, now, chat_id, bundle))
     _pending += 1
     return label_for_now(now)
+
+
+# ---------- Bundle deals ----------
+# Each bundle is a name and the products it contains, as (product, how many).
+# {colour} is filled in from the promoter's colour choice - every product below
+# comes in Black and White and always spells the colour last, so one placeholder
+# covers both. A product with no {colour} is written as-is.
+#
+# The finished strings must match column A of 'COMEX Show 2026' EXACTLY. /check
+# verifies every product in every colour and names anything that doesn't match,
+# so run it once after editing this. Set BUNDLES = {} to hide the Bundles button.
+BUNDLE_COLOURS = ("Black", "White")
+
+BUNDLES = {
+    "Arc Ultra + Sub 4": [
+        ("Sonos Arc Ultra Smart Soundbar {colour}", 1),
+        ("Sonos Sub Gen4 Wireless Subwoofer {colour}", 1),
+    ],
+    "Arc Ultra + Sub 4 + 2× Era 300": [
+        ("Sonos Arc Ultra Smart Soundbar {colour}", 1),
+        ("Sonos Sub Gen4 Wireless Subwoofer {colour}", 1),
+        ("Sonos Era 300 Stereo Speaker w Dolby Atmos {colour}", 2),
+    ],
+    "Beam (Gen 2) + Sub Mini": [
+        ("Sonos Beam Gen2 Smart Soundbar {colour}", 1),
+        ("Sonos Sub Mini Compact Subwoofer {colour}", 1),
+    ],
+    "Beam (Gen 2) + Sub Mini + 2× Era 100 SL": [
+        ("Sonos Beam Gen2 Smart Soundbar {colour}", 1),
+        ("Sonos Sub Mini Compact Subwoofer {colour}", 1),
+        ("Sonos Era 100 SL Home Bookshelf Speaker {colour}", 2),
+    ],
+}
+
+# The Bundles entry sits alongside the brands on the first product screen, so a
+# promoter reaches a bundle in the same number of taps as anything else.
+BUNDLE_MENU_LABEL = "🎁 Bundles"
+MIX_LABEL = "🎨 Mix colours…"
+
+
+def item_label(template):
+    """'Sonos Arc Ultra Smart Soundbar {colour}' -> 'Sonos Arc Ultra Smart Soundbar'."""
+    return template.replace("{colour}", "").strip()
+
+
+def bundle_lines(bundle, colours, qty=1):
+    """The bundle's products as [(full name, count), ...].
+
+    `colours` is one colour for the whole bundle, or one per line for a mix.
+    """
+    lines = BUNDLES[bundle]
+    if isinstance(colours, str):
+        colours = [colours] * len(lines)
+    return [(template.format(colour=colour), count * qty)
+            for (template, count), colour in zip(lines, colours)]
+
+
+def bundle_summary(bundle, colours=None, indent="  "):
+    """The bundle's contents as display lines, with colours once they're chosen."""
+    if colours:
+        pairs = bundle_lines(bundle, colours)
+    else:
+        pairs = [(item_label(t), n) for t, n in BUNDLES[bundle]]
+    return "\n".join(f"{indent}• {count} × {name}" for name, count in pairs)
+
+
+def bundle_problems(catalog):
+    """Bundle products that don't exist in the product tab, as readable strings.
+
+    Checked in EVERY colour: a bundle that works in Black and silently writes an
+    unknown name in White is exactly the kind of thing nobody spots until the
+    show is over. Run at start-up and by /check.
+    """
+    known = {name for brand in catalog["tree"].values()
+             for models in brand["models"].values() for name in models}
+    if not known:
+        return []  # catalogue not loaded yet - nothing to check against
+    return [f"{bundle!r}: {name!r} is not in '{PRODUCT_TAB}'"
+            for bundle, lines in BUNDLES.items()
+            for template, _ in lines
+            for name in {template.format(colour=c) for c in BUNDLE_COLOURS}
+            if name not in known]
 
 
 # ---------- Keyboard builder ----------
@@ -612,11 +722,50 @@ def remember_name(context, name):
 
 
 def brand_screen(context):
-    brands = context.user_data["catalog"]["brands"]
-    context.user_data["brands"] = brands
+    # Bundles sit at the front of the same menu rather than behind a separate
+    # command: it's one screen a promoter is already looking at, and a bundle is
+    # then the same number of taps as a single product.
+    entries = ([BUNDLE_MENU_LABEL] if BUNDLES else []) + context.user_data["catalog"]["brands"]
+    context.user_data["brands"] = entries
     promoter = context.user_data.get("sale", {}).get("name", "")
     return (f"Promoter: {promoter}\n\nSelect a brand:",
-            build_keyboard(brands, "brand", per_row=2, add_cancel=True, add_back="name"))
+            build_keyboard(entries, "brand", per_row=2, add_cancel=True, add_back="name"))
+
+
+def bundle_screen(context):
+    names = list(BUNDLES)
+    context.user_data["bundles"] = names
+    listing = "\n\n".join(f"• {name}\n{bundle_summary(name, indent='   ')}"
+                          for name in names)
+    return ("Select a bundle:\n\n" + listing,
+            build_keyboard(names, "bundle", per_row=1, add_cancel=True, add_back="brand"))
+
+
+def colour_screen(context, bundle):
+    """One tap for the whole bundle - all-black or all-white is what nearly every
+    customer takes. Mix is offered only when there is more than one product to
+    differ, and walks them item by item."""
+    options = [f"{'⚫' if c == 'Black' else '⚪'} All {c}" for c in BUNDLE_COLOURS]
+    if len(BUNDLES[bundle]) > 1:
+        options.append(MIX_LABEL)
+    context.user_data["colour_options"] = options
+    return (f"Bundle: {bundle}\n{bundle_summary(bundle)}\n\nWhat colour?",
+            build_keyboard(options, "colour", per_row=2,
+                           add_cancel=True, add_back="bundle"))
+
+
+def mix_screen(context, bundle, chosen):
+    """Colour for one item of a mixed bundle. `chosen` is what's picked so far."""
+    lines = BUNDLES[bundle]
+    index = len(chosen)
+    template, count = lines[index]
+    done = "".join(f"  ✓ {item_label(t)} — {c}\n"
+                   for (t, _), c in zip(lines, chosen))
+    return (f"Bundle: {bundle}\n{done}\n"
+            f"Colour for {count} × {item_label(template)}?\n"
+            f"(item {index + 1} of {len(lines)})",
+            build_keyboard(list(BUNDLE_COLOURS), "mix", per_row=2,
+                           add_cancel=True, add_back="mix"))
 
 
 def category_screen(context, brand):
@@ -633,20 +782,34 @@ def model_screen(context, brand, cat):
             build_keyboard(models, "model", per_row=1, add_cancel=True, add_back="cat"))
 
 
-def qty_screen(context, product):
-    return (f"Product: {product}\n\nSelect quantity:",
-            build_keyboard(QTY_CHOICES, "qty", per_row=5,
-                           add_cancel=True, add_back="model"))
+def qty_screen(context, product, bundle=None):
+    """Quantity of a single product, or of a whole bundle."""
+    if bundle:
+        colours = context.user_data.get("sale", {}).get("colours")
+        text = (f"Bundle: {bundle}\n{bundle_summary(bundle, colours)}\n\n"
+                f"How many of this bundle?")
+    else:
+        text = f"Product: {product}\n\nSelect quantity:"
+    return (text, build_keyboard(QTY_CHOICES, "qty", per_row=5, add_cancel=True,
+                                 add_back="colour" if bundle else "model"))
 
 
-def delivery_screen(context, product, qty):
-    return (f"Product: {product}\nQty: {qty}\n\nDelivery?",
+def _what(context, product, qty, bundle=None):
+    if not bundle:
+        return f"Product: {product}\nQty: {qty}"
+    colours = context.user_data.get("sale", {}).get("colours")
+    return f"Bundle: {bundle} × {qty}\n{bundle_summary(bundle, colours)}"
+
+
+def delivery_screen(context, product, qty, bundle=None):
+    return (f"{_what(context, product, qty, bundle)}\n\nDelivery?",
             build_keyboard(YES_NO, "delivery", per_row=2,
                            add_cancel=True, add_back="qty"))
 
 
-def preorder_screen(context, product, qty, delivery):
-    return (f"Product: {product}\nQty: {qty}\nDelivery: {delivery}\n\nPre-order?",
+def preorder_screen(context, product, qty, delivery, bundle=None):
+    return (f"{_what(context, product, qty, bundle)}\nDelivery: {delivery}\n\n"
+            f"Pre-order?",
             build_keyboard(YES_NO, "preorder", per_row=2,
                            add_cancel=True, add_back="delivery"))
 
@@ -716,9 +879,20 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      f"next row {next_row}{mark}")
     queued = (f"\n\n⏳ {_pending} sale(s) still being written."
               if _pending else "\n\nAll sales are on the sheet.")
+
+    problems = bundle_problems(await get_catalog())
+    if problems:
+        bundles = ("\n\n⚠️ BUNDLE PROBLEMS — these will write a product "
+                   "name that matches nothing in the catalogue:\n"
+                   + "\n".join(f"  • {p}" for p in problems))
+    elif BUNDLES:
+        bundles = f"\n\n🎁 {len(BUNDLES)} bundle(s) loaded, all products recognised."
+    else:
+        bundles = "\n\nNo bundles configured."
+
     await update.message.reply_text(
         f"✅ {len(blocks)} day block(s) found, headers OK:\n\n"
-        + "\n".join(lines) + queued)
+        + "\n".join(lines) + bundles + queued)
 
 
 async def sale(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -796,11 +970,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text, markup = category_screen(context, sale_data["brand"])
             elif value == "model":
                 text, markup = model_screen(context, sale_data["brand"], sale_data["cat"])
+            elif value == "bundle":
+                text, markup = bundle_screen(context)
+            elif value == "colour":
+                text, markup = colour_screen(context, sale_data["bundle"])
+            elif value == "mix":
+                # Rewind one item rather than dumping the promoter back to the
+                # start of the bundle - they are usually fixing the last tap.
+                chosen = sale_data.get("colours") or []
+                chosen = chosen[:-1]
+                sale_data["colours"] = chosen
+                if chosen:
+                    text, markup = mix_screen(context, sale_data["bundle"], chosen)
+                else:
+                    sale_data.pop("colours", None)
+                    text, markup = colour_screen(context, sale_data["bundle"])
             elif value == "qty":
-                text, markup = qty_screen(context, sale_data["product"])
+                text, markup = qty_screen(context, sale_data.get("product"),
+                                          sale_data.get("bundle"))
             elif value == "delivery":
-                text, markup = delivery_screen(context, sale_data["product"],
-                                               sale_data["qty"])
+                text, markup = delivery_screen(context, sale_data.get("product"),
+                                               sale_data["qty"],
+                                               sale_data.get("bundle"))
             else:
                 return
         except KeyError:
@@ -826,11 +1017,59 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif step == "brand":
         brand = pick(context, "brands", value)
+        if brand == BUNDLE_MENU_LABEL and BUNDLES:
+            sale_data.pop("product", None)
+            text, markup = bundle_screen(context)
+            await edit(query, text, markup)
+            return
         if brand is None or brand not in context.user_data["catalog"]["tree"]:
             await restart_flow(query, context, "That menu is out of date — starting over.")
             return
         sale_data["brand"] = brand
+        sale_data.pop("bundle", None)  # leaving the bundle path
         text, markup = category_screen(context, brand)
+        await edit(query, text, markup)
+
+    elif step == "bundle":
+        bundle = pick(context, "bundles", value)
+        if bundle is None or bundle not in BUNDLES:
+            await restart_flow(query, context, "That bundle is no longer available.")
+            return
+        sale_data["bundle"] = bundle
+        sale_data.pop("product", None)
+        sale_data.pop("colours", None)
+        text, markup = colour_screen(context, bundle)
+        await edit(query, text, markup)
+
+    elif step == "colour":
+        choice = pick(context, "colour_options", value)
+        bundle = sale_data.get("bundle")
+        if choice is None or bundle not in BUNDLES:
+            await restart_flow(query, context, "That menu is out of date — starting over.")
+            return
+        if choice == MIX_LABEL:
+            sale_data["colours"] = []
+            text, markup = mix_screen(context, bundle, [])
+        else:
+            # "⚫ All Black" -> "Black": the colour is the last word of the label.
+            colour = choice.split()[-1]
+            sale_data["colours"] = [colour] * len(BUNDLES[bundle])
+            text, markup = qty_screen(context, None, bundle)
+        await edit(query, text, markup)
+
+    elif step == "mix":
+        colour = fixed(list(BUNDLE_COLOURS), value)
+        bundle = sale_data.get("bundle")
+        chosen = sale_data.get("colours")
+        if colour is None or bundle not in BUNDLES or chosen is None:
+            await restart_flow(query, context, "That menu is out of date — starting over.")
+            return
+        chosen = chosen + [colour]
+        sale_data["colours"] = chosen
+        if len(chosen) < len(BUNDLES[bundle]):
+            text, markup = mix_screen(context, bundle, chosen)
+        else:
+            text, markup = qty_screen(context, None, bundle)
         await edit(query, text, markup)
 
     elif step == "cat":
@@ -848,16 +1087,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await restart_flow(query, context, "That menu is out of date — starting over.")
             return
         sale_data["product"] = product
+        sale_data.pop("bundle", None)
         text, markup = qty_screen(context, product)
         await edit(query, text, markup)
 
     elif step == "qty":
         qty = fixed(QTY_CHOICES, value)
-        if qty is None or "product" not in sale_data:
+        bundle = sale_data.get("bundle")
+        if qty is None or not (sale_data.get("product") or bundle):
             await restart_flow(query, context, "That menu is out of date — starting over.")
             return
+        if bundle and len(sale_data.get("colours") or []) != len(BUNDLES.get(bundle, ())):
+            await restart_flow(query, context, "Colours weren't finished — starting over.")
+            return
         sale_data["qty"] = qty
-        text, markup = delivery_screen(context, sale_data["product"], qty)
+        text, markup = delivery_screen(context, sale_data.get("product"), qty,
+                                       sale_data.get("bundle"))
         await edit(query, text, markup)
 
     elif step == "delivery":
@@ -866,8 +1111,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await restart_flow(query, context, "That menu is out of date — starting over.")
             return
         sale_data["delivery"] = answer
-        text, markup = preorder_screen(context, sale_data["product"],
-                                       sale_data["qty"], answer)
+        text, markup = preorder_screen(context, sale_data.get("product"),
+                                       sale_data["qty"], answer,
+                                       sale_data.get("bundle"))
         await edit(query, text, markup)
 
     elif step == "preorder":
@@ -876,21 +1122,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await restart_flow(query, context, "That menu is out of date — starting over.")
             return
         name = sale_data.get("name") or query.from_user.first_name
-        product = sale_data["product"]
+        bundle = sale_data.get("bundle")
+        product = sale_data.get("product")
+        sale_data_colours = sale_data.get("colours") or []
         qty = int(sale_data["qty"])
+        if bundle and len(sale_data_colours) != len(BUNDLES.get(bundle, ())):
+            await restart_flow(query, context, "Colours weren't finished — starting over.")
+            return
         delivery, preorder = sale_data["delivery"], answer
         context.user_data["sale"] = {}
+
+        # A bundle expands into one line per product, multiplied by how many of
+        # the bundle were sold; a normal sale is just the single product. Either
+        # way it goes to the writer as ONE sale, so it lands (or fails) whole.
+        if bundle:
+            lines = bundle_lines(bundle, sale_data_colours, qty)
+        else:
+            lines = [(product, qty)]
 
         # Hand the sale to the background writer and confirm straight away. The
         # promoter can start the next one immediately; the sheet catches up on its
         # own time, and only shouts if a sale can't be written at all.
-        label = queue_sale(name, product, delivery, preorder, qty=qty,
-                           chat_id=query.message.chat_id)
+        label = queue_sale(name, lines, delivery, preorder,
+                           chat_id=query.message.chat_id, bundle=bundle)
+        rows = sum(count for _, count in lines)
+        if bundle:
+            what = (f"Bundle: {bundle} × {qty}\n"
+                    + "".join(f"  • {count} × {item}\n" for item, count in lines)
+                    + f"({rows} row{'s' if rows != 1 else ''} on the sheet)\n")
+        else:
+            what = f"Product: {product}\nQty: {qty}\n"
         await edit(query,
                    "Recorded ✅\n\n"
                    f"Promoter: {name}\n"
-                   f"Product: {product}\n"
-                   f"Qty: {qty}\n"
+                   f"{what}"
                    f"Delivery: {delivery}\n"
                    f"Pre-order: {preorder}\n"
                    + (f"Logged to: {label}" if label else "Saving to the sheet…"),
@@ -935,7 +1200,12 @@ async def post_init(app):
         models = sum(len(m) for b in _catalog["tree"].values()
                      for m in b["models"].values())
         logging.info(f"warm: {models} products across {len(_catalog['brands'])} brand(s), "
-                     f"{len(blocks)} day blocks, cursors {_layout['cursors']}")
+                     f"{len(blocks)} day blocks, {len(BUNDLES)} bundle(s), "
+                     f"cursors {_layout['cursors']}")
+        # Loud on purpose: a mistyped bundle product writes a name that matches
+        # nothing, and nobody would notice until the show was over.
+        for problem in bundle_problems(_catalog):
+            logging.error(f"BUNDLE PROBLEM - {problem}")
     except Exception as e:
         logging.warning(f"warm-up failed (will retry on first use): {e}")
 
