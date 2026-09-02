@@ -5,6 +5,7 @@ import os
 import re
 import threading
 import time
+from typing import NamedTuple
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 import gspread
@@ -33,6 +34,10 @@ EXPECTED_HEADERS = ["s/n", "name", "product", "time", "delivery", "pre-order"]
 DAY_LABEL_RE = re.compile(r"^\s*DAY\s*\d+\s*\(\s*(\d{1,2})\s*([A-Za-z]+)", re.I)
 MONTHS = ["jan", "feb", "mar", "apr", "may", "jun",
           "jul", "aug", "sep", "oct", "nov", "dec"]
+
+# Built once: ZoneInfo() re-reads the tz database on a cache miss, and this is on
+# the path of every single sale.
+SGT = ZoneInfo("Asia/Singapore")
 
 # ---------- Throughput tuning ----------
 # The show is the stress test: ~8 promoters logging several items each at once.
@@ -106,18 +111,34 @@ def reset_sheet_cache():
 
 
 # ---------- Product cache ----------
-_products_cache = []
+# The catalogue is fixed for the whole show, so it's read once and then shaped
+# into the exact structure the menus need: {brand: {category: [model, ...]}}.
+# Building it here means a button press is a dict lookup instead of a sort over
+# every product, on every screen, for every promoter.
+_catalog = {"brands": [], "tree": {}}
 _cache_time = 0.0
 _product_refreshing = False
 
 
+def _build_catalog(products):
+    tree = {}
+    for prod in products:
+        tree.setdefault(prod["brand"], {}).setdefault(prod["category"], []).append(prod["name"])
+    return {
+        "brands": sorted(tree),
+        "tree": {b: {"cats": sorted(c), "models": c} for b, c in tree.items()},
+    }
+
+
 def refresh_products():
     """Blocking - call from a thread only."""
-    global _products_cache, _cache_time
+    global _catalog, _cache_time
     with _sheet_lock:
-        rows = get_worksheet(PRODUCT_TAB).get_all_values()
+        # A:E only - the product tab is far wider than the three columns we use,
+        # and get_all_values() drags every one of them over the wire.
+        rows = get_worksheet(PRODUCT_TAB).get("A3:E") or []
     products = []
-    for row in rows[2:]:  # skip two header rows
+    for row in rows:  # A3 already skips the two header rows
         name = row[0].strip() if len(row) > 0 else ""      # column A
         category = row[3].strip() if len(row) > 3 else ""  # column D
         brand = row[4].strip() if len(row) > 4 else ""     # column E
@@ -128,18 +149,18 @@ def refresh_products():
                 "brand": brand or "Other",
             })
     if products:
-        _products_cache = products
+        _catalog = _build_catalog(products)
         _cache_time = time.time()
-    return _products_cache
+    return _catalog
 
 
-async def get_products():
+async def get_catalog():
     """Never blocks a promoter: serve the cache, refresh in the background when stale.
 
     Only the very first call (cold cache) actually waits on Google.
     """
     global _product_refreshing
-    if not _products_cache:
+    if not _catalog["brands"]:
         return await asyncio.to_thread(refresh_products)
     if time.time() - _cache_time > PRODUCT_TTL and not _product_refreshing:
         _product_refreshing = True
@@ -154,7 +175,7 @@ async def get_products():
                 _product_refreshing = False
 
         asyncio.create_task(_bg())
-    return _products_cache
+    return _catalog
 
 
 # ---------- Column helpers ----------
@@ -176,7 +197,9 @@ def index_to_col(idx):
 
 
 def day_label(d):
-    """e.g. '3 SEPT (WED)'"""
+    """Fallback label, e.g. '3 SEPT (WED)'. Blocks normally carry the sheet's own
+    label text ('DAY 1 (3 Sept)') so a confirmation names the block a promoter can
+    actually find on the sheet."""
     month = d.strftime("%b").upper()
     if month == "SEP":
         month = "SEPT"
@@ -218,8 +241,16 @@ def header_at(row, c0):
     return all(_norm(c).startswith(h) for c, h in zip(cells, EXPECTED_HEADERS))
 
 
+class Block(NamedTuple):
+    """One show day's 6-column strip on the Sales Tracker tab."""
+    show_date: date     # the day the block is for
+    letter: str         # its first column ("A", "H", ...)
+    data_start: int     # first sheet row of sales data
+    label: str          # the sheet's own label text, e.g. "DAY 1 (3 Sept)"
+
+
 def discover_blocks(ws):
-    """Read the day blocks off the sheet: [(show_date, start_letter, data_start_row), ...].
+    """Read the day blocks off the sheet as a list of Block, in date order.
 
     Raises LayoutError rather than guessing, so a reshuffled sheet stops the bot
     instead of dropping sales into the wrong day's columns.
@@ -235,7 +266,8 @@ def discover_blocks(ws):
         letter = index_to_col(c0 + 1)
         for r in range(1, min(len(top), 6)):  # header sits a row or two below the label
             if header_at(top[r], c0):
-                blocks.append((show_date, letter, r + 2))  # sheet row r+1 holds the headers
+                # sheet row r+1 holds the headers, so data starts at r+2
+                blocks.append(Block(show_date, letter, r + 2, " ".join(text.split())))
                 break
         else:
             problems.append(f"{_norm(text)!r} at column {letter} has no "
@@ -246,13 +278,19 @@ def discover_blocks(ws):
     if not blocks:
         raise LayoutError(f"no 'DAY n (d Mon)' labels found in row 1 of '{SALES_TAB}'")
 
-    by_col = sorted(blocks, key=lambda b: col_to_index(b[1]))
-    for (_, l1, _), (_, l2, _) in zip(by_col, by_col[1:]):
-        if col_to_index(l2) - col_to_index(l1) < BLOCK_WIDTH:
-            raise LayoutError(f"the day blocks at columns {l1} and {l2} overlap "
-                              f"(each needs {BLOCK_WIDTH} columns)")
+    by_col = sorted(blocks, key=lambda b: col_to_index(b.letter))
+    for b1, b2 in zip(by_col, by_col[1:]):
+        if col_to_index(b2.letter) - col_to_index(b1.letter) < BLOCK_WIDTH:
+            raise LayoutError(f"the day blocks at columns {b1.letter} and {b2.letter} "
+                              f"overlap (each needs {BLOCK_WIDTH} columns)")
 
-    blocks.sort(key=lambda b: b[0])
+    blocks.sort(key=lambda b: b.show_date)
+    # Two blocks for the same date would make the target ambiguous and silently
+    # send every sale to whichever one sorted first.
+    for b1, b2 in zip(blocks, blocks[1:]):
+        if b1.show_date == b2.show_date:
+            raise LayoutError(f"{b1.label!r} (column {b1.letter}) and {b2.label!r} "
+                              f"(column {b2.letter}) are both for {b1.show_date}")
     return blocks
 
 
@@ -262,7 +300,7 @@ def block_for(d, blocks):
     Dates before the show fall into the first day's block; dates after it, the last.
     """
     for b in blocks:
-        if d <= b[0]:
+        if d <= b.show_date:
             return b
     return blocks[-1]
 
@@ -276,13 +314,27 @@ def block_for(d, blocks):
 _layout = {"blocks": None, "read_at": 0.0, "cursors": {}}
 
 
-def _sync_cursor(ws, letter, data_start):
-    """Point the cursor at the first free row, never moving it backwards."""
-    name_col = col_to_index(letter) + 1  # Name is the block's 2nd column
-    existing = ws.col_values(name_col)
-    from_sheet = max(len(existing) + 1, data_start)
-    _layout["cursors"][letter] = max(_layout["cursors"].get(letter, 0), from_sheet)
-    return _layout["cursors"][letter]
+def _name_col_range(block):
+    """The block's Name column, from its first data row down."""
+    letter = index_to_col(col_to_index(block.letter) + 1)  # Name is the 2nd column
+    return f"{letter}{block.data_start}:{letter}"
+
+
+def _sync_cursors(ws, blocks):
+    """Point each block's cursor at its first free row, never moving it backwards.
+
+    One batch_get covering every day block, instead of one col_values call per
+    block, and it starts at the block's own first data row so nothing above the
+    block counts. Anything a human parks BELOW the block still pushes the cursor
+    past it - deliberately, since skipping a row is safer than overwriting one.
+    """
+    if not blocks:
+        return
+    columns = ws.batch_get([_name_col_range(b) for b in blocks])
+    for block, values in zip(blocks, columns):
+        from_sheet = block.data_start + len(values or [])
+        _layout["cursors"][block.letter] = max(
+            _layout["cursors"].get(block.letter, 0), from_sheet)
 
 
 def get_blocks(force=False):
@@ -291,18 +343,18 @@ def get_blocks(force=False):
         stale = (time.time() - _layout["read_at"]) > LAYOUT_TTL
         if force or _layout["blocks"] is None or stale:
             ws = get_worksheet(SALES_TAB)
-            _layout["blocks"] = discover_blocks(ws)
-            _layout["read_at"] = time.time()
+            blocks = discover_blocks(ws)
             # Re-sync cursors in case rows were added to the sheet by hand.
-            for _, letter, data_start in _layout["blocks"]:
-                _sync_cursor(ws, letter, data_start)
+            _sync_cursors(ws, blocks)
+            _layout["blocks"] = blocks
+            _layout["read_at"] = time.time()
         return _layout["blocks"]
 
 
-def get_cursor(ws, letter, data_start):
-    if letter not in _layout["cursors"]:
-        _sync_cursor(ws, letter, data_start)
-    return _layout["cursors"][letter]
+def get_cursor(ws, block):
+    if block.letter not in _layout["cursors"]:
+        _sync_cursors(ws, [block])
+    return _layout["cursors"][block.letter]
 
 
 # ---------- Background writer ----------
@@ -361,14 +413,18 @@ def _write_batch(batch):
         # Group the burst by the day block each sale lands in.
         by_block = {}
         for i, s in enumerate(batch):
-            show_date, letter, data_start = block_for(s.day, blocks)
-            by_block.setdefault(letter, (show_date, data_start, []))[2].append((i, s))
+            block = block_for(s.day, blocks)
+            by_block.setdefault(block.letter, (block, []))[1].append((i, s))
 
-        for letter, (show_date, data_start, items) in by_block.items():
+        # Lay out every block's rows first, then send them all in ONE batch_update.
+        # A burst that spans midnight used to cost one API call per day block.
+        writes, planned = [], []
+        for block, items in by_block.values():
             try:
-                start = get_cursor(ws, letter, data_start)
+                start = get_cursor(ws, block)
             except Exception as e:
-                logging.warning(f"couldn't find the next free row in column {letter}: {e}")
+                logging.warning(f"couldn't find the next free row in column "
+                                f"{block.letter}: {e}")
                 for i, _ in items:
                     results[i] = (None, str(e), True)
                 continue
@@ -377,33 +433,37 @@ def _write_batch(batch):
             for _, s in items:
                 for _ in range(s.qty):
                     # S/N restarts at 1 for each day block
-                    rows.append([row - data_start + 1, s.name, s.product,
+                    rows.append([row - block.data_start + 1, s.name, s.product,
                                  s.clock, s.delivery, s.preorder])
                     row += 1
 
-            rng = block_range(letter, start, row - 1)
-            err = None
-            for attempt in range(WRITE_RETRIES):
-                try:
-                    ws.update(rows, rng)
-                    err = None
-                    break
-                except Exception as e:
-                    err = str(e)
-                    logging.warning(f"write to {rng} attempt {attempt + 1} failed: {e}")
-                    if attempt < WRITE_RETRIES - 1:
-                        time.sleep(2 ** attempt)
+            rng = block_range(block.letter, start, row - 1)
+            writes.append({"range": rng, "values": rows})
+            planned.append((block, row, items, rng))
 
+        if not planned:
+            return results
+
+        err = None
+        for attempt in range(WRITE_RETRIES):
+            try:
+                ws.batch_update(writes)
+                err = None
+                break
+            except Exception as e:
+                err = str(e)
+                ranges = ", ".join(p[3] for p in planned)
+                logging.warning(f"write to {ranges} attempt {attempt + 1} failed: {e}")
+                if attempt < WRITE_RETRIES - 1:
+                    time.sleep(2 ** attempt)
+
+        for block, row, items, _ in planned:
             if err is None:
                 # Only commit the rows once they're actually on the sheet, so a
                 # failed write doesn't leave a permanent gap in the day block.
-                _layout["cursors"][letter] = row
-                label = day_label(show_date)
-                for i, _ in items:
-                    results[i] = (label, None, False)
-            else:
-                for i, _ in items:
-                    results[i] = (None, err, True)
+                _layout["cursors"][block.letter] = row
+            for i, _ in items:
+                results[i] = (block.label, None, False) if err is None else (None, err, True)
     return results
 
 
@@ -474,8 +534,8 @@ def label_for_now(now=None):
     blocks = _layout["blocks"]
     if not blocks:
         return None
-    now = now or datetime.now(ZoneInfo("Asia/Singapore"))
-    return day_label(block_for(now.date(), blocks)[0])
+    now = now or datetime.now(SGT)
+    return block_for(now.date(), blocks).label
 
 
 def queue_sale(name, product, delivery, preorder, qty=1, chat_id=None):
@@ -486,7 +546,7 @@ def queue_sale(name, product, delivery, preorder, qty=1, chat_id=None):
     If the write ultimately fails, _report_failure warns the chat.
     """
     global _pending
-    now = datetime.now(ZoneInfo("Asia/Singapore"))
+    now = datetime.now(SGT)
     _write_queue.put_nowait(
         _Sale(name, product, delivery, preorder, qty, now, chat_id))
     _pending += 1
@@ -494,8 +554,18 @@ def queue_sale(name, product, delivery, preorder, qty=1, chat_id=None):
 
 
 # ---------- Keyboard builder ----------
+# Callback data is capped at 64 BYTES by Telegram. The old code pasted the label
+# straight in and sliced to 64 characters, so a long or non-ASCII brand, category
+# or promoter name was silently truncated - the menu then matched nothing and the
+# flow dead-ended, or worse, a clipped name went onto the sheet. Everything is
+# addressed by index now, and the labels live in user_data.
+QTY_CHOICES = [1, 2, 3, 4, 5]
+YES_NO = ["Yes", "No"]
+
+
 def build_keyboard(items, prefix, per_row=1, add_cancel=True, add_back=None):
-    buttons = [InlineKeyboardButton(str(i), callback_data=f"{prefix}:{i}"[:64]) for i in items]
+    buttons = [InlineKeyboardButton(str(item), callback_data=f"{prefix}:{i}")
+               for i, item in enumerate(items)]
     rows = [buttons[i:i + per_row] for i in range(0, len(buttons), per_row)]
     nav = []
     if add_back:
@@ -507,11 +577,28 @@ def build_keyboard(items, prefix, per_row=1, add_cancel=True, add_back=None):
     return InlineKeyboardMarkup(rows)
 
 
+def pick(context, key, value):
+    """Resolve an index-based callback back to its label.
+
+    Returns None if the list is gone (the bot restarted under an old message) or
+    the index is out of range, so a stale button restarts the flow than raising.
+    """
+    options = context.user_data.get(key)
+    if not options:
+        return None
+    try:
+        idx = int(value)
+    except ValueError:
+        return None
+    return options[idx] if 0 <= idx < len(options) else None
+
+
 # ---------- Screen renderers (so Back can redraw any step) ----------
 def name_prompt(context):
     recent = context.user_data.get("recent_names", [])
     text = "Who made this sale?\n\nType the promoter's name:"
-    rows = [[InlineKeyboardButton(n, callback_data=f"name:{n}"[:64])] for n in recent]
+    rows = [[InlineKeyboardButton(n, callback_data=f"name:{i}")]
+            for i, n in enumerate(recent)]
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel:x")])
     if recent:
         text += "\n\n(or tap a recent name below)"
@@ -525,48 +612,42 @@ def remember_name(context, name):
 
 
 def brand_screen(context):
-    products = context.user_data["all_products"]
-    brands = sorted(set(p["brand"] for p in products))
+    brands = context.user_data["catalog"]["brands"]
+    context.user_data["brands"] = brands
     promoter = context.user_data.get("sale", {}).get("name", "")
     return (f"Promoter: {promoter}\n\nSelect a brand:",
             build_keyboard(brands, "brand", per_row=2, add_cancel=True, add_back="name"))
 
 
 def category_screen(context, brand):
-    products = context.user_data["all_products"]
-    cats = sorted(set(p["category"] for p in products if p["brand"] == brand))
+    cats = context.user_data["catalog"]["tree"][brand]["cats"]
+    context.user_data["cats"] = cats
     return (f"Brand: {brand}\n\nSelect a category:",
             build_keyboard(cats, "cat", per_row=2, add_cancel=True, add_back="brand"))
 
 
 def model_screen(context, brand, cat):
-    products = context.user_data["all_products"]
-    models = [p["name"] for p in products if p["brand"] == brand and p["category"] == cat]
+    models = context.user_data["catalog"]["tree"][brand]["models"][cat]
     context.user_data["models"] = models
-    buttons = [InlineKeyboardButton(m, callback_data=f"model:{i}") for i, m in enumerate(models)]
-    rows = [[b] for b in buttons]
-    rows.append([
-        InlineKeyboardButton("⬅️ Back", callback_data="back:cat"),
-        InlineKeyboardButton("❌ Cancel", callback_data="cancel:x"),
-    ])
-    return f"{brand} › {cat}\n\nSelect a model:", InlineKeyboardMarkup(rows)
+    return (f"{brand} › {cat}\n\nSelect a model:",
+            build_keyboard(models, "model", per_row=1, add_cancel=True, add_back="cat"))
 
 
 def qty_screen(context, product):
     return (f"Product: {product}\n\nSelect quantity:",
-            build_keyboard([1, 2, 3, 4, 5], "qty", per_row=5,
+            build_keyboard(QTY_CHOICES, "qty", per_row=5,
                            add_cancel=True, add_back="model"))
 
 
 def delivery_screen(context, product, qty):
     return (f"Product: {product}\nQty: {qty}\n\nDelivery?",
-            build_keyboard(["Yes", "No"], "delivery", per_row=2,
+            build_keyboard(YES_NO, "delivery", per_row=2,
                            add_cancel=True, add_back="qty"))
 
 
 def preorder_screen(context, product, qty, delivery):
     return (f"Product: {product}\nQty: {qty}\nDelivery: {delivery}\n\nPre-order?",
-            build_keyboard(["Yes", "No"], "preorder", per_row=2,
+            build_keyboard(YES_NO, "preorder", per_row=2,
                            add_cancel=True, add_back="delivery"))
 
 
@@ -580,7 +661,10 @@ AGAIN_MARKUP = InlineKeyboardMarkup(
 # one message rather than sending a new one, which keeps a busy group well under
 # Telegram's per-chat send limit.
 def owns(context, query):
-    return context.user_data.get("flow_msg") == query.message.message_id
+    # query.message is None once Telegram considers the message inaccessible
+    # (too old, or deleted), so it can't be dereferenced blindly.
+    msg = query.message
+    return msg is not None and context.user_data.get("flow_msg") == msg.message_id
 
 
 async def edit(query, text, markup=None):
@@ -589,6 +673,20 @@ async def edit(query, text, markup=None):
     except BadRequest as e:
         if "not modified" not in str(e).lower():
             raise
+
+
+def fixed(options, value):
+    """Resolve an index against a constant list (quantities, Yes/No)."""
+    return options[int(value)] if value.isdigit() and int(value) < len(options) else None
+
+
+async def restart_flow(query, context, note):
+    """A stale or unresolvable button: say so and put the promoter back at step 1."""
+    context.user_data["sale"] = {}
+    context.user_data["awaiting_name"] = True
+    context.user_data["catalog"] = await get_catalog()
+    text, markup = name_prompt(context)
+    await edit(query, f"{note}\n\n{text}", markup)
 
 
 # ---------- Handlers ----------
@@ -607,14 +705,14 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Couldn't read the sheet: {e}")
         return
 
-    today = datetime.now(ZoneInfo("Asia/Singapore")).date()
+    today = datetime.now(SGT).date()
     target = block_for(today, blocks)
     lines = []
-    for show_date, letter, data_start in blocks:
-        end = index_to_col(col_to_index(letter) + BLOCK_WIDTH - 1)
-        mark = "  ← today" if (show_date, letter, data_start) == target else ""
-        next_row = _layout["cursors"].get(letter, data_start)
-        lines.append(f"{day_label(show_date)}: {letter}–{end}, "
+    for b in blocks:
+        end = index_to_col(col_to_index(b.letter) + BLOCK_WIDTH - 1)
+        mark = "  ← today" if b == target else ""
+        next_row = _layout["cursors"].get(b.letter, b.data_start)
+        lines.append(f"{b.label} ({day_label(b.show_date)}): {b.letter}–{end}, "
                      f"next row {next_row}{mark}")
     queued = (f"\n\n⏳ {_pending} sale(s) still being written."
               if _pending else "\n\nAll sales are on the sheet.")
@@ -625,7 +723,7 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def sale(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["sale"] = {}
-    context.user_data["all_products"] = await get_products()  # cached, no wait
+    context.user_data["catalog"] = await get_catalog()  # cached, no wait
     context.user_data["awaiting_name"] = True
     text, markup = name_prompt(context)
     msg = await update.message.reply_text(text, reply_markup=markup)
@@ -647,8 +745,8 @@ async def name_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["awaiting_name"] = False
     context.user_data.setdefault("sale", {})["name"] = name
     remember_name(context, name)
-    if not context.user_data.get("all_products"):
-        context.user_data["all_products"] = await get_products()
+    if not context.user_data.get("catalog"):
+        context.user_data["catalog"] = await get_catalog()
     text, markup = brand_screen(context)
     msg = await update.message.reply_text(text, reply_markup=markup)
     context.user_data["flow_msg"] = msg.message_id
@@ -656,7 +754,7 @@ async def name_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    step, value = query.data.split(":", 1)
+    step, _, value = (query.data or "").partition(":")
     sale_data = context.user_data.setdefault("sale", {})
 
     # In a group, only the promoter who opened this flow may drive it.
@@ -675,73 +773,112 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ----- Log another: reuses the same message, so no extra send -----
     if step == "again":
-        context.user_data["sale"] = {}
-        context.user_data["all_products"] = await get_products()
-        context.user_data["awaiting_name"] = True
-        text, markup = name_prompt(context)
-        await edit(query, text, markup)
+        await restart_flow(query, context, "Next sale.")
+        return
+
+    # Every step below needs the catalogue and the choices made so far. After a
+    # restart user_data is empty, so an old message's buttons would have raised a
+    # KeyError and left the promoter staring at a dead screen; now they get the
+    # name prompt back instead.
+    if not context.user_data.get("catalog"):
+        await restart_flow(query, context, "That sale expired — starting over.")
         return
 
     # ----- Back -----
     if step == "back":
-        if value == "name":
-            context.user_data["awaiting_name"] = True
-            text, markup = name_prompt(context)
-        elif value == "brand":
-            text, markup = brand_screen(context)
-        elif value == "cat":
-            text, markup = category_screen(context, sale_data["brand"])
-        elif value == "model":
-            text, markup = model_screen(context, sale_data["brand"], sale_data["cat"])
-        elif value == "qty":
-            text, markup = qty_screen(context, sale_data["product"])
-        elif value == "delivery":
-            text, markup = delivery_screen(context, sale_data["product"], sale_data["qty"])
-        else:
+        try:
+            if value == "name":
+                context.user_data["awaiting_name"] = True
+                text, markup = name_prompt(context)
+            elif value == "brand":
+                text, markup = brand_screen(context)
+            elif value == "cat":
+                text, markup = category_screen(context, sale_data["brand"])
+            elif value == "model":
+                text, markup = model_screen(context, sale_data["brand"], sale_data["cat"])
+            elif value == "qty":
+                text, markup = qty_screen(context, sale_data["product"])
+            elif value == "delivery":
+                text, markup = delivery_screen(context, sale_data["product"],
+                                               sale_data["qty"])
+            else:
+                return
+        except KeyError:
+            await restart_flow(query, context, "Lost track of that sale — starting over.")
             return
         await edit(query, text, markup)
         return
 
     # ----- Forward flow -----
+    # Buttons carry indices, so each label is resolved against the list that was
+    # on screen; a stale index restarts the flow rather than logging the wrong
+    # product or a truncated promoter name.
     if step == "name":
-        sale_data["name"] = value
+        name = pick(context, "recent_names", value)
+        if name is None:
+            await restart_flow(query, context, "That name is no longer on the list.")
+            return
+        sale_data["name"] = name
         context.user_data["awaiting_name"] = False
-        remember_name(context, sale_data["name"])
+        remember_name(context, name)
         text, markup = brand_screen(context)
         await edit(query, text, markup)
 
     elif step == "brand":
-        sale_data["brand"] = value
-        text, markup = category_screen(context, value)
+        brand = pick(context, "brands", value)
+        if brand is None or brand not in context.user_data["catalog"]["tree"]:
+            await restart_flow(query, context, "That menu is out of date — starting over.")
+            return
+        sale_data["brand"] = brand
+        text, markup = category_screen(context, brand)
         await edit(query, text, markup)
 
     elif step == "cat":
-        sale_data["cat"] = value
-        text, markup = model_screen(context, sale_data["brand"], value)
+        cat = pick(context, "cats", value)
+        if cat is None or "brand" not in sale_data:
+            await restart_flow(query, context, "That menu is out of date — starting over.")
+            return
+        sale_data["cat"] = cat
+        text, markup = model_screen(context, sale_data["brand"], cat)
         await edit(query, text, markup)
 
     elif step == "model":
-        models = context.user_data.get("models", [])
-        sale_data["product"] = models[int(value)]
-        text, markup = qty_screen(context, sale_data["product"])
+        product = pick(context, "models", value)
+        if product is None:
+            await restart_flow(query, context, "That menu is out of date — starting over.")
+            return
+        sale_data["product"] = product
+        text, markup = qty_screen(context, product)
         await edit(query, text, markup)
 
     elif step == "qty":
-        sale_data["qty"] = value
-        text, markup = delivery_screen(context, sale_data["product"], value)
+        qty = fixed(QTY_CHOICES, value)
+        if qty is None or "product" not in sale_data:
+            await restart_flow(query, context, "That menu is out of date — starting over.")
+            return
+        sale_data["qty"] = qty
+        text, markup = delivery_screen(context, sale_data["product"], qty)
         await edit(query, text, markup)
 
     elif step == "delivery":
-        sale_data["delivery"] = value
+        answer = fixed(YES_NO, value)
+        if answer is None or "qty" not in sale_data:
+            await restart_flow(query, context, "That menu is out of date — starting over.")
+            return
+        sale_data["delivery"] = answer
         text, markup = preorder_screen(context, sale_data["product"],
-                                       sale_data["qty"], value)
+                                       sale_data["qty"], answer)
         await edit(query, text, markup)
 
     elif step == "preorder":
+        answer = fixed(YES_NO, value)
+        if answer is None or "delivery" not in sale_data:
+            await restart_flow(query, context, "That menu is out of date — starting over.")
+            return
         name = sale_data.get("name") or query.from_user.first_name
         product = sale_data["product"]
         qty = int(sale_data["qty"])
-        delivery, preorder = sale_data["delivery"], value
+        delivery, preorder = sale_data["delivery"], answer
         context.user_data["sale"] = {}
 
         # Hand the sale to the background writer and confirm straight away. The
@@ -761,7 +898,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_error(update, context):
+    """Never leave a promoter looking at a frozen screen.
+
+    Anything the per-step guards miss still has to say something: the flow's
+    message is the promoter's only feedback, and silence looks exactly like a
+    sale that went through.
+    """
     logging.error("handler error", exc_info=context.error)
+    if not isinstance(update, Update):
+        return
+    try:
+        if update.callback_query is not None:
+            await update.callback_query.answer(
+                "Something went wrong — tap /sale to start again.", show_alert=True)
+        elif update.effective_message is not None:
+            await update.effective_message.reply_text(
+                "Something went wrong — tap /sale to start again.")
+    except Exception:
+        logging.debug("couldn't deliver the error notice", exc_info=True)
 
 
 _writer_task = None
@@ -778,8 +932,10 @@ async def post_init(app):
     try:
         await asyncio.to_thread(refresh_products)
         blocks = await asyncio.to_thread(get_blocks, True)
-        logging.info(f"warm: {len(_products_cache)} products, {len(blocks)} day blocks, "
-                     f"cursors {_layout['cursors']}")
+        models = sum(len(m) for b in _catalog["tree"].values()
+                     for m in b["models"].values())
+        logging.info(f"warm: {models} products across {len(_catalog['brands'])} brand(s), "
+                     f"{len(blocks)} day blocks, cursors {_layout['cursors']}")
     except Exception as e:
         logging.warning(f"warm-up failed (will retry on first use): {e}")
 
