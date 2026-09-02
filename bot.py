@@ -23,11 +23,13 @@ PRODUCT_TAB = "COMEX Show 2026"
 SALES_TAB = "Sales Tracker"
 
 # ---------- Show-day layout ----------
-# Each show day gets its own 6-column block on the Sales Tracker tab:
+# Each show day gets its own block of columns on the Sales Tracker tab:
 #   a day label row ("DAY 1 (3 Sept)"), then the header row (S/N, Name,
-#   Product (Colour), Time, Delivery?, Pre-order?), then the sales rows beneath it.
-# The layout is read off the sheet rather than hardcoded, so an inserted column
-# or an extra day block can't silently send sales to the wrong place.
+#   Product (Colour), Time, then the flag columns), then the sales rows beneath.
+# Blocks need not be the same width - day 1 has a Cash & Carry column the others
+# don't - so the layout is read off the sheet rather than hardcoded, and an
+# inserted column or an extra day block can't silently send sales astray.
+# The bot writes Name onwards only; the S/N column belongs to the sheet.
 SHOW_YEAR = 2026  # the day labels carry no year
 # Every block opens with these four, in this order, then carries one or more
 # "flag" columns. Which flags, and in what order, is read off each block's own
@@ -286,6 +288,21 @@ class Block(NamedTuple):
     def width(self):
         return len(CORE_HEADERS) + len(self.flags)
 
+    @property
+    def name_col(self):
+        """The Name column - the first one the bot writes.
+
+        S/N is deliberately skipped: the sheet owns that column, whether it's
+        pre-numbered by hand or filled by a formula. The bot only ever writes
+        Name onwards, so nothing it does can disturb the numbering.
+        """
+        return index_to_col(col_to_index(self.letter) + 1)
+
+    @property
+    def write_width(self):
+        """How many columns the bot writes - everything but S/N."""
+        return self.width - 1
+
 
 def discover_blocks(ws):
     """Read the day blocks off the sheet as a list of Block, in date order.
@@ -361,9 +378,12 @@ _layout = {"blocks": None, "read_at": 0.0, "cursors": {}}
 
 
 def _name_col_range(block):
-    """The block's Name column, from its first data row down."""
-    letter = index_to_col(col_to_index(block.letter) + 1)  # Name is the 2nd column
-    return f"{letter}{block.data_start}:{letter}"
+    """The block's Name column, from its first data row down.
+
+    The cursor is found from Name, never from S/N, so a row that carries only a
+    pre-printed serial number still counts as empty and gets filled.
+    """
+    return f"{block.name_col}{block.data_start}:{block.name_col}"
 
 
 def _sync_cursors(ws, blocks):
@@ -498,17 +518,15 @@ def _write_batch(batch):
             rows, row = [], start
             for _, s in items:
                 # A bundle contributes one row per unit of each of its products,
-                # written exactly like individually-logged sales, so unit counts
-                # and the sheet's pre-printed S/N column stay in step.
+                # written exactly like individually-logged sales, so a bundle of
+                # four counts as four units.
                 cells = flag_cells(s.fulfilment, block.flags)
                 for product, count in s.lines:
                     for _ in range(count):
-                        # S/N restarts at 1 for each day block
-                        rows.append([row - block.data_start + 1, s.name, product,
-                                     s.clock] + cells)
+                        rows.append([s.name, product, s.clock] + cells)
                         row += 1
 
-            rng = block_range(block.letter, start, row - 1, block.width)
+            rng = block_range(block.name_col, start, row - 1, block.write_width)
             writes.append({"range": rng, "values": rows})
             planned.append((block, row, items, rng))
 
@@ -947,7 +965,8 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cols = ", ".join(FLAG_NAMES[f] for f in b.flags)
         note = "" if "cash" in b.flags else "  ⚠️ no Cash & Carry column"
         lines.append(f"{b.label} ({day_label(b.show_date)}): {b.letter}–{end} "
-                     f"[{cols}], next row {next_row}{mark}{note}")
+                     f"[{cols}], writes {b.name_col}–{end} (S/N untouched), "
+                     f"next row {next_row}{mark}{note}")
     queued = (f"\n\n⏳ {_pending} sale(s) still being written."
               if _pending else "\n\nAll sales are on the sheet.")
 
