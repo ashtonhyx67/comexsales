@@ -487,6 +487,8 @@ class _Sale:
         items = "\n".join(f"  • {count} × {product}" for product, count in self.lines)
         if self.bundle:
             return f"Bundle: {self.bundle}\n{items}"
+        if len(self.lines) > 1:
+            return f"{len(self.lines)} products:\n{items}"
         product, count = self.lines[0]
         return f"Product: {product}\nQty: {count}"
 
@@ -719,9 +721,14 @@ BUNDLES = {
 # the two paths from being confused with one another - a bundle is a different
 # kind of sale, not another brand.
 KIND_BUNDLE = "🎁 Bundle"
-KIND_INDIVIDUAL = "🎧 Individual"
-KIND_CHOICES = [KIND_BUNDLE, KIND_INDIVIDUAL]
+KIND_SINGLE = "🎧 Single"
+KIND_MULTIPLE = "🛒 Multiple"
 MIX_LABEL = "🎨 Mix colours…"
+
+
+def kind_options():
+    """The kinds on offer. Bundle only appears when bundles are configured."""
+    return ([KIND_BUNDLE] if BUNDLES else []) + [KIND_SINGLE, KIND_MULTIPLE]
 
 
 def item_label(template):
@@ -855,20 +862,48 @@ def remember_name(context, name):
 
 
 def kind_screen(context):
-    """Bundle or individual item - the first thing after the promoter's name."""
+    """What sort of sale this is - the first thing after the promoter's name."""
+    options = kind_options()
+    context.user_data["kind_options"] = options
     promoter = context.user_data.get("sale", {}).get("name", "")
-    return (f"Promoter: {promoter}\n\nBundle or individual item?",
-            build_keyboard(KIND_CHOICES, "kind", per_row=2,
+    return (f"Promoter: {promoter}\n\nWhat kind of sale?\n"
+            f"({KIND_SINGLE.split()[-1]} = one product, "
+            f"{KIND_MULTIPLE.split()[-1]} = several products for one customer)",
+            build_keyboard(options, "kind", per_row=len(options),
                            add_cancel=True, add_back="name"))
+
+
+def cart_lines(cart, indent="  "):
+    return "\n".join(f"{indent}{i}. {qty} × {product}"
+                      for i, (product, qty) in enumerate(cart, 1))
+
+
+def cart_screen(context):
+    """The running basket for a Multiple sale, between products."""
+    cart = context.user_data.get("sale", {}).get("cart") or []
+    units = sum(qty for _, qty in cart)
+    text = (f"Items so far — {len(cart)} product(s), {units} unit(s):\n"
+            f"{cart_lines(cart)}\n\nAdd another product, or log these?")
+    rows = [[InlineKeyboardButton("➕ Add another product", callback_data="cart:add")],
+            [InlineKeyboardButton(f"✅ Done — log these {units} unit(s)",
+                                  callback_data="cart:done")]]
+    if cart:
+        rows.append([InlineKeyboardButton(f"↩️ Remove last ({cart[-1][0][:24]})",
+                                          callback_data="cart:undo")])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel:x")])
+    return text, InlineKeyboardMarkup(rows)
 
 
 def brand_screen(context):
     brands = context.user_data["catalog"]["brands"]
     context.user_data["brands"] = brands
     promoter = context.user_data.get("sale", {}).get("name", "")
+    if context.user_data.get("sale", {}).get("cart"):
+        back = "cart"          # already picking a second product
+    else:
+        back = "kind"
     return (f"Promoter: {promoter}\n\nSelect a brand:",
-            build_keyboard(brands, "brand", per_row=2, add_cancel=True,
-                           add_back="kind" if BUNDLES else "name"))
+            build_keyboard(brands, "brand", per_row=2, add_cancel=True, add_back=back))
 
 
 def bundle_screen(context):
@@ -883,10 +918,11 @@ def bundle_screen(context):
 def first_screen(context):
     """Where a flow goes once the promoter's name is known.
 
-    Straight to the brands when no bundles are configured, so the extra tap only
-    exists when there is actually a choice to make.
+    Always the kind question: even with no bundles configured there is still
+    Single vs Multiple to settle, and it has to be settled before the first
+    product is picked.
     """
-    return kind_screen(context) if BUNDLES else brand_screen(context)
+    return kind_screen(context)
 
 
 def colour_screen(context, bundle):
@@ -931,7 +967,13 @@ def model_screen(context, brand, cat):
 
 
 def qty_screen(context, product, bundle=None):
-    """Quantity of a single product, or of a whole bundle."""
+    """Quantity of one product, or of a whole bundle."""
+    if not bundle and context.user_data.get("sale", {}).get("mode") == "multi":
+        cart = context.user_data["sale"].get("cart") or []
+        so_far = f"Already added:\n{cart_lines(cart)}\n\n" if cart else ""
+        return (f"{so_far}Product: {product}\n\nHow many?",
+                build_keyboard(QTY_CHOICES, "qty", per_row=5,
+                               add_cancel=True, add_back="model"))
     if bundle:
         colours = context.user_data.get("sale", {}).get("colours")
         text = (f"Bundle: {bundle}\n{bundle_summary(bundle, colours)}\n\n"
@@ -943,6 +985,10 @@ def qty_screen(context, product, bundle=None):
 
 
 def _what(context, product, qty, bundle=None):
+    cart = context.user_data.get("sale", {}).get("cart")
+    if cart:
+        units = sum(q for _, q in cart)
+        return f"{len(cart)} product(s), {units} unit(s):\n{cart_lines(cart)}"
     if not bundle:
         return f"Product: {product}\nQty: {qty}"
     colours = context.user_data.get("sale", {}).get("colours")
@@ -950,9 +996,12 @@ def _what(context, product, qty, bundle=None):
 
 
 def fulfilment_screen(context, product, qty, bundle=None):
+    # One customer, one way of taking the goods - asked once for the whole
+    # basket rather than per product.
+    back = "cart" if context.user_data.get("sale", {}).get("cart") else "qty"
     return (f"{_what(context, product, qty, bundle)}\n\nHow is it going out?",
             build_keyboard([f[0] for f in FULFILMENTS], "fulfil", per_row=1,
-                           add_cancel=True, add_back="qty"))
+                           add_cancel=True, add_back=back))
 
 
 AGAIN_MARKUP = InlineKeyboardMarkup(
@@ -1112,6 +1161,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text, markup = name_prompt(context)
             elif value == "kind":
                 text, markup = kind_screen(context)
+            elif value == "cart":
+                if sale_data.get("cart"):
+                    text, markup = cart_screen(context)
+                else:
+                    text, markup = brand_screen(context)
             elif value == "brand":
                 text, markup = brand_screen(context)
             elif value == "cat":
@@ -1164,17 +1218,47 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit(query, text, markup)
 
     elif step == "kind":
-        choice = fixed(KIND_CHOICES, value)
+        choice = pick(context, "kind_options", value)
         if choice is None:
             await restart_flow(query, context, "That menu is out of date — starting over.")
             return
+        for key in ("product", "bundle", "colours", "cart", "qty"):
+            sale_data.pop(key, None)
         if choice == KIND_BUNDLE and BUNDLES:
-            sale_data.pop("product", None)
+            sale_data["mode"] = "bundle"
             text, markup = bundle_screen(context)
         else:
-            sale_data.pop("bundle", None)
-            sale_data.pop("colours", None)
+            sale_data["mode"] = "multi" if choice == KIND_MULTIPLE else "single"
+            if sale_data["mode"] == "multi":
+                sale_data["cart"] = []
             text, markup = brand_screen(context)
+        await edit(query, text, markup)
+
+    elif step == "cart":
+        cart = sale_data.get("cart")
+        if cart is None:
+            await restart_flow(query, context, "That basket is gone — starting over.")
+            return
+        if value == "add":
+            sale_data.pop("product", None)
+            text, markup = brand_screen(context)
+        elif value == "undo":
+            if cart:
+                cart.pop()
+            if cart:
+                text, markup = cart_screen(context)
+            else:
+                # emptied: the cart screen would have nothing to show
+                sale_data.pop("product", None)
+                text, markup = brand_screen(context)
+        elif value == "done":
+            if not cart:
+                sale_data.pop("product", None)
+                text, markup = brand_screen(context)
+            else:
+                text, markup = fulfilment_screen(context, None, None)
+        else:
+            return
         await edit(query, text, markup)
 
     elif step == "brand":
@@ -1262,13 +1346,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await restart_flow(query, context, "Colours weren't finished — starting over.")
             return
         sale_data["qty"] = qty
-        text, markup = fulfilment_screen(context, sale_data.get("product"), qty,
-                                         sale_data.get("bundle"))
+        if sale_data.get("mode") == "multi" and not bundle:
+            # Another line in the basket rather than the end of the sale.
+            sale_data.setdefault("cart", []).append((sale_data["product"], qty))
+            sale_data.pop("product", None)
+            text, markup = cart_screen(context)
+        else:
+            text, markup = fulfilment_screen(context, sale_data.get("product"), qty,
+                                             sale_data.get("bundle"))
         await edit(query, text, markup)
 
     elif step == "fulfil":
         choice = fixed(FULFILMENTS, value)
-        if choice is None or "qty" not in sale_data:
+        if choice is None or not (sale_data.get("cart") or "qty" in sale_data):
             await restart_flow(query, context, "That menu is out of date — starting over.")
             return
         _, fulfilment = choice
@@ -1277,7 +1367,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bundle = sale_data.get("bundle")
         product = sale_data.get("product")
         colours = sale_data.get("colours") or []
-        qty = int(sale_data["qty"])
+        cart = list(sale_data.get("cart") or [])
+        qty = int(sale_data.get("qty") or 1)
         if bundle and len(colours) != len(BUNDLES.get(bundle, ())):
             await restart_flow(query, context, "Colours weren't finished — starting over.")
             return
@@ -1290,6 +1381,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # way it goes to the writer as ONE sale, so it lands (or fails) whole.
         if bundle:
             lines = bundle_lines(bundle, colours, qty)
+        elif cart:
+            # Several products, one customer: one _Sale, so they land together.
+            lines = cart
         else:
             lines = [(product, qty)]
 
@@ -1301,6 +1395,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows = sum(count for _, count in lines)
         if bundle:
             what = (f"Bundle: {bundle} × {qty}\n"
+                    + "".join(f"  • {count} × {item}\n" for item, count in lines)
+                    + f"({rows} row{'s' if rows != 1 else ''} on the sheet)\n")
+        elif cart:
+            what = (f"{len(cart)} products:\n"
                     + "".join(f"  • {count} × {item}\n" for item, count in lines)
                     + f"({rows} row{'s' if rows != 1 else ''} on the sheet)\n")
         else:

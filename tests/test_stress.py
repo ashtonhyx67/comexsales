@@ -145,7 +145,34 @@ async def promoter(name, n_sales, log, double_tap=False):
             # rows = how many of the bundle x how many units it contains
             units = sum(c for _, c in bot.BUNDLES[b])
             expect = None
-        else:                                            # an individual item
+        elif random.random() < 0.5:                      # MULTIPLE: a basket
+            q = await tap(ctx, "kind:2")
+            n_items = random.randint(2, 4)
+            basket = 0
+            for k in range(n_items):
+                bi = random.randrange(len(CAT["brands"]))
+                await tap(ctx, f"brand:{bi}")
+                brand = CAT["brands"][bi]
+                ci = random.randrange(len(CAT["tree"][brand]["cats"]))
+                await tap(ctx, f"cat:{ci}")
+                cat_name = CAT["tree"][brand]["cats"][ci]
+                mi = random.randrange(len(CAT["tree"][brand]["models"][cat_name]))
+                await tap(ctx, f"model:{mi}")
+                iq = random.randint(0, 4)
+                q = await tap(ctx, f"qty:{iq}")
+                basket += iq + 1
+                if k < n_items - 1:
+                    q = await tap(ctx, "cart:add")
+            q = await tap(ctx, "cart:done")
+            fi = random.randrange(len(bot.FULFILMENTS))
+            if double_tap:
+                await asyncio.gather(tap(ctx, f"fulfil:{fi}"), tap(ctx, f"fulfil:{fi}"))
+            else:
+                await tap(ctx, f"fulfil:{fi}")
+            log.append((name, None, basket))
+            await asyncio.sleep(0)
+            continue
+        else:                                            # SINGLE: one product
             q = await tap(ctx, "kind:1")
             bi = random.randrange(len(CAT["brands"]))
             q = await tap(ctx, f"brand:{bi}")

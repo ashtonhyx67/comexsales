@@ -224,8 +224,9 @@ ok(B4 in d and "Sonos Era 100 SL Home Bookshelf Speaker White" in d,
 ctx2 = types.SimpleNamespace(user_data={"catalog": cat, "sale": {"name": "Amy"}})
 t, markup = bot.kind_screen(ctx2)
 labels = [b.text for r in markup.inline_keyboard for b in r]
-ok(labels[:2] == [bot.KIND_BUNDLE, bot.KIND_INDIVIDUAL], f"kind options: {labels[:2]}")
-ok("Bundle or individual item?" in t and "Amy" in t, "kind screen names the promoter")
+ok(labels[:3] == [bot.KIND_BUNDLE, bot.KIND_SINGLE, bot.KIND_MULTIPLE],
+   f"kind options: {labels[:3]}")
+ok("What kind of sale?" in t and "Amy" in t, "kind screen names the promoter")
 backs = [b.callback_data for r in markup.inline_keyboard for b in r
          if b.callback_data.startswith("back:")]
 ok(backs == ["back:name"], f"kind screen backs to the name prompt: {backs}")
@@ -245,19 +246,20 @@ ok(backs == ["back:kind"], f"bundle screen backs to the kind question: {backs}")
 
 # with no bundles configured the extra tap disappears entirely
 saved = dict(bot.BUNDLES); bot.BUNDLES.clear()
+ok(bot.kind_options() == [bot.KIND_SINGLE, bot.KIND_MULTIPLE],
+   "no bundles configured -> the Bundle choice disappears")
 t, m = bot.first_screen(ctx2)
-ok("Select a brand" in t, "no bundles configured -> straight to the brands")
-backs = [b.callback_data for r in m.inline_keyboard for b in r
-         if b.callback_data.startswith("back:")]
-ok(backs == ["back:name"], f"and Back skips the kind screen too: {backs}")
+ok("What kind of sale?" in t, "Single/Multiple are still offered")
 bot.BUNDLES.update(saved)
 t, _ = bot.first_screen(ctx2)
-ok("Bundle or individual item?" in t, "with bundles configured -> the kind question")
+ok(bot.KIND_BUNDLE in [b.text for r in _.inline_keyboard for b in r],
+   "with bundles configured the Bundle choice is back")
 _, markup = bot.bundle_screen(ctx2)
 ok(all(len(b.callback_data.encode()) <= 64 for r in markup.inline_keyboard for b in r),
    "bundle buttons within Telegram's 64-byte cap")
-ok(bot.fixed(bot.KIND_CHOICES, "0") == bot.KIND_BUNDLE
-   and bot.fixed(bot.KIND_CHOICES, "1") == bot.KIND_INDIVIDUAL,
+ok(bot.pick(ctx2, "kind_options", "0") == bot.KIND_BUNDLE
+   and bot.pick(ctx2, "kind_options", "1") == bot.KIND_SINGLE
+   and bot.pick(ctx2, "kind_options", "2") == bot.KIND_MULTIPLE,
    "kind indices resolve")
 
 if __name__ == "__main__":   # importable by test_flow without exiting
