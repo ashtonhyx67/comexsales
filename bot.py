@@ -33,15 +33,19 @@ SALES_TAB = "Sales Tracker"
 # Each show day gets its own block of columns on the Sales Tracker tab:
 #   a day label row ("DAY 1 (3 Sept)"), then the header row (S/N, Name,
 #   Product (Colour), Time, then the flag columns), then the sales rows beneath.
-# Blocks need not be the same width - day 1 has a Cash & Carry column the others
-# don't - so the layout is read off the sheet rather than hardcoded, and an
-# inserted column or an extra day block can't silently send sales astray.
-# The bot writes Name onwards only; the S/N column belongs to the sheet.
+# Blocks need not all be the same width, so the layout is read off the sheet
+# rather than hardcoded and an inserted column or an extra day block can't
+# silently send sales astray. As of the 2026 show all four days are identical -
+# S/N | Name | Product (Colour) | Time | Cash & Carry | Delivery? | Pre-order? -
+# at columns A, I, Q and Y, but the bot does not depend on that.
+# The bot writes Name onwards only. The S/N column belongs to the sheet, which
+# auto-numbers it with =IF(B3="","",ROW()-2); writing there would wipe those
+# formulas, so the write range deliberately starts one column in.
 SHOW_YEAR = 2026  # the day labels carry no year
 # Every block opens with these four, in this order, then carries one or more
 # "flag" columns. Which flags, and in what order, is read off each block's own
-# header row: day 1 has Cash & Carry | Delivery? | Pre-order? while the other
-# days still have only Delivery? | Pre-order?, and both have to work.
+# header row, so a day carrying Cash & Carry | Delivery? | Pre-order? and one
+# carrying only Delivery? | Pre-order? both work, in either column order.
 CORE_HEADERS = ["s/n", "name", "product", "time"]
 REQUIRED_FLAGS = ("delivery", "preorder")   # a block without these is malformed
 FLAG_NAMES = {"cash": "Cash & Carry", "delivery": "Delivery?", "preorder": "Pre-order?"}

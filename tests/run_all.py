@@ -2,8 +2,8 @@
 import os, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SUITES = ["test_bot", "test_bundles", "test_layout", "test_flow",
-          "test_delete", "test_days", "test_stress"]
+SUITES = ["test_bot", "test_bundles", "test_live_shape", "test_layout",
+          "test_flow", "test_delete", "test_days", "test_stress"]
 env = dict(os.environ, PYTHONIOENCODING="utf-8",
            BOT_TOKEN=os.environ.get("BOT_TOKEN", "x"),
            GOOGLE_CREDENTIALS=os.environ.get("GOOGLE_CREDENTIALS", "{}"))

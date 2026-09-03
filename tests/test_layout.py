@@ -1,4 +1,10 @@
-"""The sheet as it is TODAY: day 1 has Cash & Carry, days 2-4 do not."""
+"""REGRESSION: day blocks of DIFFERENT widths must both work.
+
+This models the sheet mid-change, when day 1 had a Cash & Carry column and days
+2-4 did not. All four days now match (see test_live_shape.py), but the ragged
+case is kept so adding or removing a column on one day only can never silently
+misalign that day's writes.
+"""
 import os, sys, types
 from datetime import date, datetime
 
@@ -20,7 +26,7 @@ NEW = CORE + ["Cash & Carry", "Delivery?", "Pre-order?"]
 
 
 def sheet(day1=NEW, rest=OLD):
-    """Blocks laid out exactly as the live sheet: A(7), I(6), P(6), W(6)."""
+    """A deliberately ragged layout: A(7), I(6), P(6), W(6)."""
     g = {}
     for label, c0, hdrs in [("DAY 1 (3 Sept)", 1, day1), ("DAY 2 (4 Sept)", 9, rest),
                             ("DAY 3 (5 Sept)", 16, rest), ("DAY 4 (6 Sept)", 23, rest)]:
